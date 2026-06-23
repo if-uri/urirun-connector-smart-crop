@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "if-uri" }]
-dependencies = ["urirun>=0.4.14", "pillow>=10"]
+dependencies = ["urirun>=0.4.14", "pillow>=10", "numpy>=1.26", "opencv-python-headless>=4.8"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pillow>=10"]
+test = ["pytest>=8", "pillow>=10", "numpy>=1.26", "opencv-python-headless>=4.8"]
 
 [project.urls]
 Homepage = "https://connect.ifuri.com/connectors/smart-crop"

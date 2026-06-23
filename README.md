@@ -37,6 +37,8 @@ The result includes:
 - `crop.reason`: why detection was skipped when not reliable.
 
 The detector intentionally prefers a conservative "no crop" over a wrong crop.
-It uses Pillow only: bright low-saturation connected components are scored as
-document candidates, edge-touching regions and wide background bands are rejected,
-and the selected component is padded slightly before saving.
+It uses OpenCV first to detect a document quadrilateral, rectify perspective,
+and keep documents that touch the camera frame edge. A Pillow connected-component
+detector remains as a fallback for simple bright-document scenes. Candidates are
+scored using contour shape, text/edge density, and penalties for false positives
+such as bright horizontal background bands.

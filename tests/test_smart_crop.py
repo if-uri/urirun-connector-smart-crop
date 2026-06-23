@@ -52,7 +52,7 @@ def test_detect_document_crop_writes_crop(tmp_path: Path) -> None:
     assert crop["width"] < 180
     assert crop["height"] > 120
     assert crop["box"][0] > 40
-    assert crop["method"] == "connected-component"
+    assert crop["method"] in {"opencv-perspective", "connected-component"}
 
 
 def test_detect_document_crop_ignores_bright_background_band(tmp_path: Path) -> None:
@@ -64,6 +64,44 @@ def test_detect_document_crop_ignores_bright_background_band(tmp_path: Path) -> 
     assert crop["box"][1] > 100
     assert crop["box"][0] > 110
     assert crop["box"][2] < 340
+
+
+def test_detect_document_crop_rectifies_perspective_document(tmp_path: Path) -> None:
+    image = Image.new("RGB", (600, 420), (45, 47, 50))
+    draw = ImageDraw.Draw(image)
+    draw.polygon([(180, 40), (420, 75), (390, 370), (145, 330)], fill=(247, 245, 235), outline=(20, 20, 20))
+    for y in (120, 170, 220, 270):
+        draw.line((200, y, 360, y + 18), fill=(30, 30, 30), width=4)
+    source = tmp_path / "perspective.jpg"
+    image.save(source)
+
+    crop = detect_document_crop(source)
+
+    assert crop["ok"] is True
+    assert crop["method"] == "opencv-perspective"
+    assert len(crop["quad"]) == 4
+    assert crop["box"][0] > 100
+    assert crop["box"][2] < 460
+    assert crop["width"] > 220
+    assert crop["height"] > 280
+
+
+def test_detect_document_crop_keeps_document_touching_frame_edge(tmp_path: Path) -> None:
+    image = Image.new("RGB", (420, 620), (38, 39, 42))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((2, 12, 260, 610), fill=(248, 247, 240), outline=(20, 20, 20), width=3)
+    for y in range(60, 560, 55):
+        draw.line((28, y, 230, y), fill=(30, 30, 30), width=4)
+    source = tmp_path / "edge-receipt.jpg"
+    image.save(source)
+
+    crop = detect_document_crop(source)
+
+    assert crop["ok"] is True
+    assert crop["method"] == "opencv-perspective"
+    assert crop["box"][0] <= 5
+    assert crop["cropHeight"] > 560
+    assert crop["component"]["touchesEdge"] is True
 
 
 def test_detect_document_crop_auto_orients_sideways_receipt_to_portrait(tmp_path: Path) -> None:

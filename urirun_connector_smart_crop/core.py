@@ -12,6 +12,7 @@ Routes:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -154,6 +155,256 @@ def _line_orientation_score(image) -> dict[str, Any]:
     }
 
 
+def _distance(a: Any, b: Any) -> float:
+    return float(math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
+
+
+def _order_quad_points(points: Any) -> Any:
+    import numpy as np
+
+    pts = np.asarray(points, dtype="float32").reshape(4, 2)
+    ordered = np.zeros((4, 2), dtype="float32")
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).reshape(4)
+    ordered[0] = pts[int(np.argmin(sums))]
+    ordered[2] = pts[int(np.argmax(sums))]
+    ordered[1] = pts[int(np.argmin(diffs))]
+    ordered[3] = pts[int(np.argmax(diffs))]
+    return ordered
+
+
+def _expand_quad(points: Any, margin_ratio: float, width: int, height: int) -> Any:
+    import numpy as np
+
+    pts = np.asarray(points, dtype="float32").reshape(4, 2)
+    center = pts.mean(axis=0)
+    factor = 1.0 + (2.0 * max(0.0, float(margin_ratio)))
+    expanded = center + (pts - center) * factor
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, max(0, width - 1))
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, max(0, height - 1))
+    return expanded.astype("float32")
+
+
+def _quad_dimensions(points: Any) -> tuple[int, int]:
+    ordered = _order_quad_points(points)
+    width_a = _distance(ordered[2], ordered[3])
+    width_b = _distance(ordered[1], ordered[0])
+    height_a = _distance(ordered[1], ordered[2])
+    height_b = _distance(ordered[0], ordered[3])
+    return max(1, int(round(max(width_a, width_b)))), max(1, int(round(max(height_a, height_b))))
+
+
+def _warp_quad(full: Any, points: Any) -> Any:
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    ordered = _order_quad_points(points)
+    width, height = _quad_dimensions(ordered)
+    dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
+    matrix = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(np.asarray(full.convert("RGB")), matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(warped)
+
+
+def _contour_quad(contour: Any) -> Any | None:
+    import cv2
+    import numpy as np
+
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter <= 0:
+        return None
+    for epsilon_ratio in (0.015, 0.025, 0.035, 0.05, 0.075):
+        approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            return approx.reshape(4, 2).astype("float32")
+
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect).astype("float32")
+    box_area = max(1.0, float(rect[1][0] * rect[1][1]))
+    fill = float(cv2.contourArea(contour)) / box_area
+    if fill >= 0.45:
+        return box
+    return None
+
+
+def _opencv_document_crop(
+    full: Any,
+    source: Path,
+    *,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+    save: bool,
+    auto_orient: bool,
+    prefer_portrait: bool,
+    max_side: int,
+    margin_ratio: float,
+    quality: int,
+    min_component_area_ratio: float,
+) -> dict[str, Any]:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
+
+    original_width, original_height = full.size
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    rgb = np.asarray(full.convert("RGB"))
+    if scale < 1.0:
+        analysis = cv2.resize(rgb, (max(1, int(original_width * scale)), max(1, int(original_height * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        analysis = rgb
+    ah, aw = analysis.shape[:2]
+    gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    hsv = cv2.cvtColor(analysis, cv2.COLOR_RGB2HSV)
+    light_mask = cv2.inRange(hsv, (0, 0, 135), (179, 105, 255))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    light_mask = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+    light_mask = cv2.morphologyEx(light_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+    edges = cv2.Canny(blur, 45, 135)
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edge_mask = cv2.dilate(edges, edge_kernel, iterations=1)
+    edge_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+
+    adaptive = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+    adaptive_edges = cv2.Canny(adaptive, 40, 120)
+    adaptive_edges = cv2.dilate(adaptive_edges, edge_kernel, iterations=1)
+    adaptive_edges = cv2.morphologyEx(adaptive_edges, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+    masks = (
+        ("light-region", light_mask),
+        ("edge-contour", edge_mask),
+        ("adaptive-edge", adaptive_edges),
+    )
+    min_area = max(180.0, float(aw * ah) * max(0.0001, float(min_component_area_ratio)))
+    candidates: list[dict[str, Any]] = []
+    for mask_name, mask in masks:
+        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 35 or h < 35:
+                continue
+            bbox_ratio = (w * h) / float(aw * ah)
+            if bbox_ratio < 0.018 or bbox_ratio > 0.985:
+                continue
+            aspect = w / float(h)
+            long_aspect = max(aspect, 1.0 / max(0.001, aspect))
+            if long_aspect > 8.5:
+                continue
+            quad = _contour_quad(contour)
+            if quad is None:
+                continue
+            quad_width, quad_height = _quad_dimensions(quad)
+            if quad_width < 35 or quad_height < 35:
+                continue
+            quad_area = abs(float(cv2.contourArea(quad.astype("float32"))))
+            quad_ratio = quad_area / float(aw * ah)
+            if quad_ratio < 0.018 or quad_ratio > 0.985:
+                continue
+            fill = area / max(1.0, quad_area)
+            touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
+            region = gray[y:y + h, x:x + w]
+            region_edges = edges[y:y + h, x:x + w]
+            dark_fraction = float(np.count_nonzero(region < 115)) / float(max(1, region.size))
+            edge_density = float(np.count_nonzero(region_edges)) / float(max(1, region_edges.size))
+            edge_penalty = 0.86 if touches_edge else 1.0
+            top_band_penalty = 0.18 if aspect > 3.0 and y < ah * 0.12 and h < ah * 0.38 else 1.0
+            wide_strip_penalty = 0.48 if aspect > 4.0 else 0.76 if aspect > 3.2 else 1.0
+            content_bonus = max(0.18, min(1.25, (dark_fraction * 18.0) + (edge_density * 10.0)))
+            area_bonus = min(1.0, quad_ratio * 2.4)
+            shape_bonus = min(1.25, max(0.35, fill))
+            mask_bonus = 1.18 if mask_name != "light-region" else 1.0
+            score = area * area_bonus * shape_bonus * edge_penalty * top_band_penalty * wide_strip_penalty * content_bonus * mask_bonus
+            candidates.append({
+                "mask": mask_name,
+                "area": area,
+                "fill": fill,
+                "score": score,
+                "bbox": (x, y, w, h),
+                "bboxArea": bbox_ratio,
+                "quadArea": quad_ratio,
+                "aspect": aspect,
+                "darkFraction": dark_fraction,
+                "edgeDensity": edge_density,
+                "touchesEdge": touches_edge,
+                "quad": quad,
+            })
+
+    if not candidates:
+        return {"ok": False, "reason": "no reliable opencv document contour"}
+
+    best = max(candidates, key=lambda item: item["score"])
+    inv_scale = 1.0 / scale
+    quad = np.asarray(best["quad"], dtype="float32") * inv_scale
+    quad = _expand_quad(quad, margin_ratio, original_width, original_height)
+    min_xy = quad.min(axis=0)
+    max_xy = quad.max(axis=0)
+    box = (
+        max(0, int(math.floor(float(min_xy[0])))),
+        max(0, int(math.floor(float(min_xy[1])))),
+        min(original_width, int(math.ceil(float(max_xy[0])))),
+        min(original_height, int(math.ceil(float(max_xy[1])))),
+    )
+    crop_width = box[2] - box[0]
+    crop_height = box[3] - box[1]
+    if crop_width < 50 or crop_height < 50:
+        return {"ok": False, "reason": "opencv crop too small", "box": list(box)}
+
+    warped = _warp_quad(full, quad)
+    oriented, orientation = _orient_document_image(warped, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
+
+    target = ""
+    if save:
+        if output_path:
+            target_path = Path(output_path).expanduser().resolve()
+        elif output_dir:
+            out_dir = Path(output_dir).expanduser().resolve()
+            target_path = out_dir / f"{source.stem}-document-crop.jpg"
+        else:
+            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
+        target = str(target_path)
+
+    return {
+        "ok": True,
+        "method": "opencv-perspective",
+        "path": target,
+        "originalPath": str(source),
+        "box": list(box),
+        "quad": [[round(float(x), 2), round(float(y), 2)] for x, y in _order_quad_points(quad)],
+        "coverage": round(float(best["area"]) / float(aw * ah), 4),
+        "bboxArea": round(float(best["bboxArea"]), 4),
+        "quadArea": round(float(best["quadArea"]), 4),
+        "threshold": None,
+        "fill": round(float(best["fill"]), 4),
+        "component": {
+            "area": int(round(float(best["area"]))),
+            "aspect": round(float(best["aspect"]), 4),
+            "score": round(float(best["score"]), 4),
+            "mask": best["mask"],
+            "darkFraction": round(float(best["darkFraction"]), 4),
+            "edgeDensity": round(float(best["edgeDensity"]), 4),
+            "touchesEdge": bool(best["touchesEdge"]),
+        },
+        "orientation": orientation,
+        "originalWidth": original_width,
+        "originalHeight": original_height,
+        "cropWidth": crop_width,
+        "cropHeight": crop_height,
+        "width": oriented.size[0],
+        "height": oriented.size[1],
+    }
+
+
 def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: bool = True) -> tuple[Any, dict[str, Any]]:
     if not auto_orient:
         return image, {"enabled": False, "angle": 0, "reason": "disabled", "width": image.size[0], "height": image.size[1]}
@@ -241,6 +492,22 @@ def detect_document_crop(
             "originalWidth": original_width,
             "originalHeight": original_height,
         }
+
+    opencv_result = _opencv_document_crop(
+        full,
+        source,
+        output_path=output_path,
+        output_dir=output_dir,
+        save=save,
+        auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait,
+        max_side=max_side,
+        margin_ratio=margin_ratio,
+        quality=quality,
+        min_component_area_ratio=min_component_area_ratio,
+    )
+    if opencv_result.get("ok"):
+        return opencv_result
 
     scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
     analysis = full.resize((max(1, int(original_width * scale)), max(1, int(original_height * scale)))) if scale < 1.0 else full

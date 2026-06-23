@@ -1,0 +1,54 @@
+{
+  "id": "smart-crop",
+  "name": "Smart document crop",
+  "uriSchemes": [
+    "smartcrop"
+  ],
+  "status": "available",
+  "category": "Computer Vision",
+  "summary": "Detect, crop and auto-orient receipts, invoices and documents from larger images before OCR.",
+  "description": "Provides smartcrop:// routes for conservative document/receipt detection, cropping and orientation correction. The connector preserves the original image, returns structured crop + orientation metadata, and is designed to run before ocr:// so OCR engines see a portrait-oriented document with horizontal text lines rather than the full camera frame.",
+  "version": "0.1.0",
+  "publisher": {
+    "name": "if-uri",
+    "url": "https://ifuri.com",
+    "github": "https://github.com/if-uri"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "document",
+    "receipt",
+    "invoice",
+    "crop",
+    "ocr-preprocess",
+    "orientation",
+    "deskew",
+    "camera",
+    "pillow",
+    "computer-vision"
+  ],
+  "routes": [
+    "smartcrop://host/document/query/crop",
+    "smartcrop://host/document/query/detect"
+  ],
+  "payloadOptions": {
+    "auto_orient": "Default true. Rotate the cropped document so text lines are horizontal.",
+    "prefer_portrait": "Default true. Prefer portrait output, useful for receipts and invoices.",
+    "margin_ratio": "Padding around the detected document before saving.",
+    "fail_if_uncertain": "On crop route, fail instead of returning the original when detection is uncertain."
+  },
+  "requires": {
+    "python": [
+      "urirun",
+      "pillow"
+    ],
+    "optional": []
+  },
+  "install": {
+    "pip": "urirun-connector-smart-crop",
+    "local": "pip install -e /home/tom/github/if-uri/urirun-connector-smart-crop"
+  },
+  "adapterKinds": [
+    "local-function"
+  ]
+}

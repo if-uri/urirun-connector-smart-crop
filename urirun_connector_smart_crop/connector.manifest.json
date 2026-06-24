@@ -7,7 +7,7 @@
   "status": "available",
   "category": "Computer Vision",
   "summary": "Detect, crop and auto-orient receipts, invoices and documents from larger images before OCR.",
-  "description": "Provides smartcrop:// routes for conservative document/receipt detection, cropping and orientation correction. By default it crops from text-line boxes detected by a trained model (PaddleOCR, with Tesseract word boxes as fallback), expands those boundaries to the paper component detected from background contrast using a scale-invariant text-line-height margin, and keeps the full frame when the document is already tightly framed. It falls back to a geometric cascade (OpenCV contour/perspective, bright-sheet fill-ratio, text-region and connected-component thresholds) when no usable text is present. The connector preserves the original image, returns structured crop + orientation metadata, and is designed to run before ocr:// so OCR engines see a portrait-oriented document with horizontal text lines rather than the full camera frame.",
+  "description": "Provides smartcrop:// routes for conservative document/receipt detection, cropping and orientation correction. By default it crops from detected text-line boxes (fast Tesseract first, escalating to the trained PaddleOCR detector only when Tesseract is uncertain), expands those boundaries to the paper component detected from background contrast using a scale-invariant text-line-height margin, and keeps the full frame when the document is already tightly framed. It falls back to a geometric cascade (OpenCV contour/perspective, bright-sheet fill-ratio, text-region and connected-component thresholds) when no usable text is present. The connector preserves the original image, returns structured crop + orientation metadata, and is designed to run before ocr:// so OCR engines see a portrait-oriented document with horizontal text lines rather than the full camera frame.",
   "version": "0.1.0",
   "publisher": {
     "name": "if-uri",
@@ -37,7 +37,7 @@
     "margin_ratio": "Padding around the detected document before saving.",
     "fail_if_uncertain": "On crop route, fail instead of returning the original when detection is uncertain.",
     "use_text_boundary": "Default true. Crop from detected text boundaries, expand to the background-contrast paper component, then fall back to geometry when unavailable.",
-    "text_boundary_backend": "Default auto (prefers the trained PaddleOCR detector, falls back to Tesseract). Supported: auto, paddleocr, tesseract, none/off. Unsupported values fall back to geometry with metadata rather than failing the whole crop."
+    "text_boundary_backend": "Default auto (fast Tesseract first ~0.5s, escalates to the trained PaddleOCR detector ~4s only when Tesseract is uncertain). Supported: auto, paddleocr, tesseract, none/off. Unsupported values fall back to geometry with metadata rather than failing the whole crop."
   },
   "requires": {
     "python": [

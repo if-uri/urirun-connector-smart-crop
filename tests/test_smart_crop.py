@@ -812,3 +812,38 @@ def test_detect_route_tags_output_as_frozen_artifact(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["kind"] == "crop-detection"
     assert result["live"] is False
+
+
+def test_auto_prefers_tesseract_when_confident(monkeypatch) -> None:
+    """auto = tesseract-first: a confident Tesseract read wins and PaddleOCR is NOT invoked."""
+    from urirun_connector_smart_crop import core
+    _fake_tesseract(monkeypatch, {
+        "conf": ["90"] * 6, "text": [f"w{i}" for i in range(6)],
+        "left": [10, 20, 30, 40, 50, 60], "top": [10, 20, 30, 40, 50, 60],
+        "width": [20] * 6, "height": [10] * 6,
+    })
+    called = {"paddle": False}
+
+    def _no_paddle(*_a, **_k):
+        called["paddle"] = True
+        return {"ok": False, "backend": "paddleocr"}
+
+    monkeypatch.setattr(core, "_paddleocr_text_boxes", _no_paddle)
+    res = core._detect_text_boxes(Image.new("RGB", (200, 300), (255, 255, 255)), backend="auto")
+    assert res["ok"] and res["backend"] == "tesseract"
+    assert called["paddle"] is False  # fast path, no escalation
+
+
+def test_auto_escalates_to_paddle_when_tesseract_uncertain(monkeypatch) -> None:
+    """auto escalates to the trained detector only when Tesseract finds too few words."""
+    from urirun_connector_smart_crop import core
+    _fake_tesseract(monkeypatch, {
+        "conf": ["90"] * 2, "text": ["a", "b"],
+        "left": [10, 20], "top": [10, 20], "width": [20, 20], "height": [10, 10],
+    })
+    monkeypatch.setattr(core, "_paddleocr_text_boxes", lambda *_a, **_k: {
+        "ok": True, "backend": "paddleocr", "boxes": [[1, 1, 9, 9]] * 3,
+        "wordCount": 3, "lineHeight": 8.0, "clean": True,
+    })
+    res = core._detect_text_boxes(Image.new("RGB", (200, 300), (255, 255, 255)), backend="auto")
+    assert res["ok"] and res["backend"] == "paddleocr"  # escalated

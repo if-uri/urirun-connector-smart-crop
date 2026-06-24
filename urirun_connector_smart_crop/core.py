@@ -1444,13 +1444,20 @@ def _detect_text_boxes(
     if normalized == "tesseract":
         return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
     if normalized in {"", "auto"}:
-        # Prefer the trained detector: it is repeatable across document types/languages
-        # and does not need per-document tuning. Fall back to Tesseract when PaddleOCR or
-        # its model is unavailable, then (via the caller) to the geometric cascade.
+        # Fast path first: Tesseract (~0.5s) reads a clear receipt fine. Escalate to the
+        # heavier but more robust trained PaddleOCR detector (~4s on CPU) ONLY when Tesseract
+        # is uncertain (too few confident words: faint/low-contrast/non-Latin text), then
+        # (via the caller) to the geometric cascade. This keeps the common case ~8x faster
+        # while still recovering hard scans where the trained detector earns its cost.
+        tesseract = _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+        if tesseract.get("ok"):
+            return tesseract
         paddle = _paddleocr_text_boxes(full)
         if paddle.get("ok"):
             return paddle
-        return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+        # Neither produced usable text; surface Tesseract's reason (the first attempt) so the
+        # caller falls back to the geometric cascade.
+        return tesseract
     return {
         "ok": False,
         "backend": normalized,

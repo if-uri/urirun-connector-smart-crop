@@ -25,10 +25,17 @@ urirun run smartcrop://host/document/query/crop \
 ```
 
 The crop route defaults to `auto_orient=true` and `prefer_portrait=true`, so a
-sideways receipt is saved as a portrait image with horizontal text lines.
+sideways receipt is saved as a portrait image with horizontal text lines. Orientation
+is decided by a **trained classifier first** (PaddleOCR `PP-LCNet_x1_0_doc_ori`) and only
+falls back to tesseract OSD / the geometric heuristic when the model is unavailable — the
+geometric `rowPeak − colPeak` signal is unreliable on narrow receipts (it can rotate an
+already-upright scan onto its side), so the classifier is authoritative when confident
+(`crop.orientation.source == "paddle-doc-orientation"`).
 Text-boundary cropping is enabled by default with `text_boundary_backend=auto`,
-which prefers the trained **PaddleOCR** detector and falls back to **Tesseract**
-when PaddleOCR or its model is unavailable. Force a specific backend with
+which tries fast **Tesseract** first (~0.5s) and escalates to the trained
+**PaddleOCR** detector (~4s on CPU) only when Tesseract is uncertain (too few
+confident words: faint/low-contrast/non-Latin text) — keeping the common case fast
+while still recovering hard scans. Force a specific backend with
 `text_boundary_backend=paddleocr` or `=tesseract`, or use `use_text_boundary=false`
 / `text_boundary_backend=none` to force the geometric cascade.
 
@@ -38,7 +45,8 @@ The result includes:
 - `originalPath`: original input path,
 - `crop.ok`: whether a reliable crop was written,
 - `crop.box`: `[left, top, right, bottom]` in original image pixels,
-- `crop.orientation`: applied rotation angle and candidate scores,
+- `crop.orientation`: applied rotation `angle`, `rotated`, and `source`
+  (`paddle-doc-orientation` | `osd` | `geometry`) plus candidate scores,
 - `crop.reason`: why detection was skipped when not reliable.
 - `crop.partialEdge`: true when the detector saw only a clipped fragment of a
   document at the frame edge; the caller should ask for another frame instead of

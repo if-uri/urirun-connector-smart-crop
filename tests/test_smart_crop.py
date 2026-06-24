@@ -81,12 +81,35 @@ def test_detect_document_crop_ignores_connected_bright_tape_and_crops_receipt(tm
     crop = detect_document_crop(source)
 
     assert crop["ok"] is True
-    assert crop["method"] in {"text-region", "opencv-perspective"}
+    assert crop["method"] in {"text-region", "opencv-perspective", "fill-ratio"}
     assert crop["bboxArea"] < 0.45
     assert crop["box"][0] > 90
     assert crop["box"][1] > 250
     assert crop["cropWidth"] < 280
     assert crop["cropHeight"] < 340
+
+
+def test_detect_document_crop_prefers_receipt_over_large_edge_fabric_strip(tmp_path: Path) -> None:
+    image = Image.new("RGB", (720, 720), (104, 106, 96))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 300, 720), fill=(176, 174, 158))
+    draw.rectangle((0, 0, 520, 58), fill=(188, 184, 164))
+    for x in range(28, 292, 42):
+        draw.line((x, 0, x + 24, 720), fill=(152, 151, 137), width=2)
+    draw.rectangle((315, 325, 565, 638), fill=(250, 248, 236))
+    draw.text((344, 372), "Polskie ePlatnosci", fill=(22, 22, 22))
+    for y in (420, 444, 470, 502, 542, 586, 616):
+        draw.line((344, y, 528, y), fill=(20, 20, 20), width=4)
+    source = tmp_path / "receipt-edge-fabric-strip.jpg"
+    image.save(source)
+
+    crop = detect_document_crop(source, save=False)
+
+    assert crop["ok"] is True
+    assert crop["box"][0] > 250
+    assert crop["box"][1] > 280
+    assert crop["bboxArea"] < 0.35
+    assert crop["method"] in {"fill-ratio", "text-region", "opencv-perspective"}
 
 
 def test_detect_document_crop_rectifies_perspective_document(tmp_path: Path) -> None:
@@ -211,3 +234,29 @@ def test_manifest() -> None:
     assert manifest["uriSchemes"] == ["smartcrop"]
     assert set(manifest["routes"]) == ALL_ROUTES
     json.dumps(manifest)
+
+
+def test_detect_document_crop_handles_receipt_with_brightness_gradient(tmp_path: Path) -> None:
+    """The real QUO CAFE failure: a small receipt with a top-to-bottom brightness gradient
+    (top whiter than bottom) next to a large light duct-tape 'L'. The fill-ratio solid-sheet
+    detector must crop the WHOLE receipt (incl. the dimmer bottom with the amount), not the tape."""
+    image = Image.new("RGB", (1000, 1400), (70, 75, 72))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((110, 70, 250, 900), fill=(190, 188, 182))     # vertical tape strip
+    draw.rectangle((110, 70, 770, 210), fill=(190, 188, 182))     # horizontal tape strip
+    # receipt with a vertical brightness gradient: top ~252 → bottom ~218
+    for i, y in enumerate(range(980, 1330, 5)):
+        v = int(252 - (y - 980) / 350.0 * 34)
+        draw.rectangle((360, y, 720, y + 5), fill=(v, v, v - 2))
+    for y in range(1010, 1300, 26):
+        draw.line((385, y, 695, y), fill=(15, 15, 15), width=4)
+    source = tmp_path / "receipt-gradient.jpg"
+    image.save(source)
+
+    crop = detect_document_crop(source, save=False)
+    assert crop["ok"] is True
+    x0, y0, x1, y1 = crop["box"]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    assert 350 <= cx <= 730 and 960 <= cy <= 1350, f"crop centred on {cx},{cy} (distractor?)"
+    assert (y1 - y0) > 250, "crop must span the full receipt height, not just the bright top"
+    assert crop["bboxArea"] < 0.4

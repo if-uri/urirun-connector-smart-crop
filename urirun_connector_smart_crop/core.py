@@ -856,7 +856,12 @@ def detect_document_crop(
         min_component_area_ratio=min_component_area_ratio,
     )
     # A confident, tight opencv crop wins (preserves perspective/edge-document handling).
-    if opencv_result.get("ok") and float(opencv_result.get("bboxArea") or 1.0) <= 0.55:
+    # Exception: a large, edge-touching component is often a bright background strip
+    # (tape/table/fabric) next to a smaller receipt. Let fill-ratio compete first.
+    opencv_component = opencv_result.get("component") if isinstance(opencv_result.get("component"), dict) else {}
+    opencv_area = float(opencv_result.get("bboxArea") or 1.0) if opencv_result.get("ok") else 1.0
+    large_edge_component = bool(opencv_component.get("touchesEdge")) and opencv_area > 0.38
+    if opencv_result.get("ok") and opencv_area <= 0.55 and not large_edge_component:
         return opencv_result
 
     # opencv missing or kept most of the frame (small sheet + big bright distractor). The
@@ -876,7 +881,6 @@ def detect_document_crop(
     )
     if fill_result.get("ok"):
         fill_area = float(fill_result.get("bboxArea") or 1.0)
-        opencv_area = float(opencv_result.get("bboxArea") or 1.0) if opencv_result.get("ok") else 1.0
         if fill_area < 0.5 and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
             return fill_result
 

@@ -53,8 +53,8 @@ The result includes:
   saving a bad scan.
 
 The detector intentionally prefers a conservative "no crop" over a wrong crop.
-It first detects text-line boxes with a trained model (PaddleOCR, or Tesseract
-word boxes as fallback), then expands that boundary out to the paper component
+It first detects text-line boxes (fast Tesseract, escalating to the trained
+PaddleOCR detector only when Tesseract is uncertain), then expands that boundary out to the paper component
 detected from background contrast, per side. The residual margin is a fixed
 multiple of the detected text-line height — a scale-invariant typographic unit,
 not a hand-tuned fraction of the frame — so the same logic holds for a small

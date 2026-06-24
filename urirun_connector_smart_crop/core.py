@@ -802,6 +802,297 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
     }
 
 
+def _box_containment(inner: Any, outer: Any) -> float:
+    """Fraction of the ``inner`` box's area that lies inside the ``outer`` box.
+
+    Both boxes are ``[left, top, right, bottom]``. Returns 0.0 when either box is
+    missing or degenerate. 1.0 means ``inner`` is fully enclosed by ``outer``.
+    """
+    try:
+        il, it, ir, ib = (float(v) for v in inner)
+        ol, ot, orr, ob = (float(v) for v in outer)
+    except (TypeError, ValueError):
+        return 0.0
+    inner_area = max(0.0, ir - il) * max(0.0, ib - it)
+    if inner_area <= 0.0:
+        return 0.0
+    iw = max(0.0, min(ir, orr) - max(il, ol))
+    ih = max(0.0, min(ib, ob) - max(it, ot))
+    return (iw * ih) / inner_area
+
+
+def _box_area(box: Any) -> float:
+    try:
+        left, top, right, bottom = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, right - left) * max(0.0, bottom - top)
+
+
+def _box_union(a: Any, b: Any) -> list[float]:
+    left_a, top_a, right_a, bottom_a = (float(v) for v in a)
+    left_b, top_b, right_b, bottom_b = (float(v) for v in b)
+    return [min(left_a, left_b), min(top_a, top_b), max(right_a, right_b), max(bottom_a, bottom_b)]
+
+
+def _clip_box(box: Any, width: int, height: int) -> tuple[int, int, int, int]:
+    left, top, right, bottom = (float(v) for v in box)
+    return (
+        max(0, min(width - 1, int(math.floor(left)))),
+        max(0, min(height - 1, int(math.floor(top)))),
+        max(1, min(width, int(math.ceil(right)))),
+        max(1, min(height, int(math.ceil(bottom)))),
+    )
+
+
+def _background_box_around_text(full: Any, text_box: Any, *, max_side: int = 700) -> dict[str, Any]:
+    """Find the background-contrast paper component that contains the OCR text box."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
+
+    original_width, original_height = full.size
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    rgb = np.asarray(full.convert("RGB"))
+    analysis = cv2.resize(
+        rgb,
+        (max(1, int(original_width * scale)), max(1, int(original_height * scale))),
+        interpolation=cv2.INTER_AREA,
+    ) if scale < 1.0 else rgb
+    ah, aw = analysis.shape[:2]
+    lab = cv2.cvtColor(analysis, cv2.COLOR_RGB2LAB).astype("float32")
+    band = max(4, int(min(aw, ah) * 0.055))
+    border = np.concatenate((
+        lab[:band, :, :].reshape(-1, 3),
+        lab[-band:, :, :].reshape(-1, 3),
+        lab[:, :band, :].reshape(-1, 3),
+        lab[:, -band:, :].reshape(-1, 3),
+    ), axis=0)
+    background = np.median(border, axis=0)
+    distance = np.sqrt(np.sum((lab - background) ** 2, axis=2))
+    border_distance = np.sqrt(np.sum((border - background) ** 2, axis=1))
+    threshold = min(105.0, max(24.0, float(np.percentile(border_distance, 85)) + 10.0))
+    mask = (distance > threshold).astype("uint8") * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23)), iterations=2)
+
+    text_scaled = [float(value) * scale for value in text_box]
+    contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    total = float(aw * ah)
+    candidates: list[dict[str, Any]] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < max(180.0, total * 0.012):
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 35 or h < 35:
+            continue
+        component_box = [float(x), float(y), float(x + w), float(y + h)]
+        text_containment = _box_containment(text_scaled, component_box)
+        if text_containment < 0.35:
+            continue
+        bbox_area = (w * h) / total
+        if bbox_area < 0.018 or bbox_area > 0.96:
+            continue
+        fill = area / float(max(1, w * h))
+        if fill < 0.14:
+            continue
+        score = area * fill * (0.7 + text_containment)
+        candidates.append({
+            "box": component_box,
+            "score": score,
+            "area": area,
+            "fill": fill,
+            "bboxArea": bbox_area,
+            "textContainment": text_containment,
+            "threshold": threshold,
+        })
+
+    if not candidates:
+        return {"ok": False, "reason": "no background component around text"}
+
+    best = max(candidates, key=lambda item: item["score"])
+    inv = 1.0 / scale
+    scaled_box = best["box"]
+    box = _clip_box([value * inv for value in scaled_box], original_width, original_height)
+    return {
+        "ok": True,
+        "box": list(box),
+        "bboxArea": round(_box_area(box) / float(original_width * original_height), 4),
+        "area": int(round(float(best["area"]) / float(scale * scale))),
+        "fill": round(float(best["fill"]), 4),
+        "score": round(float(best["score"]), 4),
+        "textContainment": round(float(best["textContainment"]), 4),
+        "threshold": round(float(best["threshold"]), 4),
+    }
+
+
+def _tesseract_text_boxes(full: Any, *, min_conf: float = 45.0, min_words: int = 6, ocr_max_side: int = 1600) -> dict[str, Any]:
+    try:
+        import pytesseract
+        from pytesseract import Output
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "backend": "tesseract", "reason": f"tesseract unavailable: {exc}"}
+
+    ow, oh = full.size
+    scale = min(1.0, float(ocr_max_side) / max(ow, oh))
+    analysis = full.resize((max(1, int(ow * scale)), max(1, int(oh * scale)))) if scale < 1.0 else full
+    try:
+        data = pytesseract.image_to_data(analysis, output_type=Output.DICT)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "backend": "tesseract", "reason": f"tesseract failed: {exc}"}
+
+    boxes: list[tuple[float, float, float, float]] = []
+    for i, conf in enumerate(data.get("conf", [])):
+        try:
+            confidence = float(conf)
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if confidence < min_conf or not str(data["text"][i] or "").strip():
+            continue
+        boxes.append((
+            float(data["left"][i]),
+            float(data["top"][i]),
+            float(data["left"][i] + data["width"][i]),
+            float(data["top"][i] + data["height"][i]),
+        ))
+
+    if len(boxes) < min_words:
+        return {"ok": False, "backend": "tesseract", "reason": "too little confident text", "wordCount": len(boxes)}
+    inv = 1.0 / scale
+    return {
+        "ok": True,
+        "backend": "tesseract",
+        "boxes": [[value * inv for value in box] for box in boxes],
+        "wordCount": len(boxes),
+    }
+
+
+def _detect_text_boxes(
+    full: Any,
+    *,
+    backend: str = "auto",
+    min_conf: float = 45.0,
+    min_words: int = 6,
+    ocr_max_side: int = 1600,
+) -> dict[str, Any]:
+    normalized = str(backend or "auto").strip().lower()
+    if normalized in {"", "auto"}:
+        normalized = "tesseract"
+    if normalized in {"off", "none", "false", "disabled"}:
+        return {"ok": False, "backend": normalized, "reason": "text boundary backend disabled"}
+    if normalized != "tesseract":
+        return {
+            "ok": False,
+            "backend": normalized,
+            "reason": f"unsupported text boundary backend: {normalized}",
+            "supportedBackends": ["auto", "tesseract"],
+        }
+    return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+
+
+def _text_boundary_document_crop(
+    full: Any,
+    source: Path,
+    *,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+    save: bool,
+    auto_orient: bool,
+    prefer_portrait: bool,
+    margin_ratio: float,
+    quality: int,
+    backend: str = "auto",
+    min_conf: float = 45.0,
+    min_words: int = 6,
+    ocr_max_side: int = 1600,
+) -> dict[str, Any]:
+    """Crop a document to the boundary of its detected text (Tesseract word boxes).
+
+    This is the most reliable signal for receipts/invoices photographed on a busy
+    surface: the union of the actual text boxes follows the document body instead of
+    chasing the brightest patch, so the crop is neither cut through the middle nor
+    overly tight. Outer edges use a 1st/99th percentile so a stray detection on the
+    background cannot blow the box up to the whole frame. Returns ``ok: False`` (so the
+    caller falls back to the geometric cascade) when Tesseract is unavailable or the
+    frame has too little confident text (e.g. a blank sheet or a synthetic test image).
+    """
+    try:
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"text-boundary deps unavailable: {exc}"}
+
+    ow, oh = full.size
+    detected_text = _detect_text_boxes(full, backend=backend, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+    if not detected_text.get("ok"):
+        return detected_text
+
+    boxes = detected_text.get("boxes") or []
+    lefts = [float(box[0]) for box in boxes]
+    tops = [float(box[1]) for box in boxes]
+    rights = [float(box[2]) for box in boxes]
+    bottoms = [float(box[3]) for box in boxes]
+
+    x0 = float(np.percentile(lefts, 1))
+    y0 = float(np.percentile(tops, 1))
+    x1 = float(np.percentile(rights, 99))
+    y1 = float(np.percentile(bottoms, 99))
+    text_box = (x0, y0, x1, y1)
+    background_box = _background_box_around_text(full, text_box)
+    if background_box.get("ok") and background_box.get("box"):
+        x0, y0, x1, y1 = _box_union(text_box, background_box["box"])
+
+    bw = x1 - x0
+    bh = y1 - y0
+    if bw < 40 or bh < 40:
+        return {"ok": False, "reason": "text region too small"}
+
+    pad_x = bw * max(float(margin_ratio), 0.07)
+    top_pad = bh * max(float(margin_ratio), 0.055)
+    bottom_pad = bh * max(float(margin_ratio), 0.28)
+    box = _clip_box((x0 - pad_x, y0 - top_pad, x1 + pad_x, y1 + bottom_pad), ow, oh)
+    bbox_area = ((box[2] - box[0]) * (box[3] - box[1])) / float(ow * oh)
+    if (not background_box.get("ok") and bbox_area > 0.82) or bbox_area > 0.985:
+        box = (0, 0, ow, oh)
+        bbox_area = 1.0
+
+    cropped = full.crop(box)
+    oriented, orientation = _orient_document_image(cropped, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
+
+    target = ""
+    if save:
+        if output_path:
+            target_path = Path(output_path).expanduser().resolve()
+        elif output_dir:
+            target_path = Path(output_dir).expanduser().resolve() / f"{source.stem}-document-crop.jpg"
+        else:
+            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
+        target = str(target_path)
+
+    return {
+        "ok": True,
+        "method": "text-boundary",
+        "path": target,
+        "originalPath": str(source),
+        "box": list(box),
+        "bboxArea": round(bbox_area, 4),
+        "textBoundaryBackend": detected_text.get("backend"),
+        "wordCount": int(detected_text.get("wordCount") or len(lefts)),
+        "background": background_box if background_box.get("ok") else None,
+        "orientation": orientation,
+        "originalWidth": ow,
+        "originalHeight": oh,
+        "cropWidth": box[2] - box[0],
+        "cropHeight": box[3] - box[1],
+        "width": oriented.size[0],
+        "height": oriented.size[1],
+    }
+
+
 def detect_document_crop(
     image: str | Path,
     *,
@@ -814,6 +1105,8 @@ def detect_document_crop(
     margin_ratio: float = 0.035,
     quality: int = 94,
     min_component_area_ratio: float = 0.004,
+    use_text_boundary: bool = True,
+    text_boundary_backend: str = "auto",
 ) -> dict[str, Any]:
     """Detect and optionally write a cropped document image.
 
@@ -841,6 +1134,25 @@ def detect_document_crop(
             "originalWidth": original_width,
             "originalHeight": original_height,
         }
+
+    # Text boundary first: for receipts/invoices the union of detected text boxes follows
+    # the document far more reliably than bright-region geometry, which tended to crop
+    # through the middle. Falls back to the geometric cascade when there is no usable text.
+    if use_text_boundary:
+        text_boundary_result = _text_boundary_document_crop(
+            full,
+            source,
+            output_path=output_path,
+            output_dir=output_dir,
+            save=save,
+            auto_orient=auto_orient,
+            prefer_portrait=prefer_portrait,
+            margin_ratio=margin_ratio,
+            quality=quality,
+            backend=text_boundary_backend,
+        )
+        if text_boundary_result.get("ok"):
+            return text_boundary_result
 
     opencv_result = _opencv_document_crop(
         full,
@@ -881,10 +1193,35 @@ def detect_document_crop(
     )
     if fill_result.get("ok"):
         fill_area = float(fill_result.get("bboxArea") or 1.0)
-        if fill_area < 0.5 and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
+        # If the fill-ratio box sits inside a text-rich opencv box, it is a bright
+        # sub-patch of that document (header whitespace, a fold), not a separate sheet.
+        # Preferring it would crop through the middle of the document, so keep opencv.
+        # A bright distractor (tape/table/fabric) has low edge density, so a fill box
+        # contained in *that* is still the real, tighter document and should win.
+        opencv_edge = float(opencv_component.get("edgeDensity") or 0.0)
+        contained = _box_containment(fill_result.get("box"), opencv_result.get("box")) if opencv_result.get("ok") else 0.0
+        fragment_of_document = contained >= 0.85 and opencv_edge >= 0.05
+        if fill_area < 0.5 and not fragment_of_document and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
             return fill_result
 
     if opencv_result.get("ok"):
+        # Detectors save eagerly to output_path, so a fill-ratio run that did not win
+        # has already overwritten the file with its (wrong) crop. Re-save the chosen
+        # opencv crop so the file on disk matches the returned result.
+        if save and fill_result.get("ok"):
+            opencv_result = _opencv_document_crop(
+                full,
+                source,
+                output_path=output_path,
+                output_dir=output_dir,
+                save=save,
+                auto_orient=auto_orient,
+                prefer_portrait=prefer_portrait,
+                max_side=max_side,
+                margin_ratio=margin_ratio,
+                quality=quality,
+                min_component_area_ratio=min_component_area_ratio,
+            )
         return opencv_result
 
     text_region_result = _text_region_document_crop(
@@ -1015,6 +1352,8 @@ def document_detect(
     max_side: int = 700,
     margin_ratio: float = 0.035,
     min_component_area_ratio: float = 0.004,
+    use_text_boundary: bool = True,
+    text_boundary_backend: str = "auto",
 ) -> dict[str, Any]:
     """Detect a document/receipt bounding box without writing a cropped file."""
     if not image:
@@ -1027,6 +1366,8 @@ def document_detect(
         max_side=max_side,
         margin_ratio=margin_ratio,
         min_component_area_ratio=min_component_area_ratio,
+        use_text_boundary=use_text_boundary,
+        text_boundary_backend=text_boundary_backend,
     )
     if result.get("ok"):
         return urirun.ok(connector=CONNECTOR_ID, crop=result, image=str(_path(image)))
@@ -1045,6 +1386,8 @@ def document_crop(
     prefer_portrait: bool = True,
     fail_if_uncertain: bool = False,
     min_component_area_ratio: float = 0.004,
+    use_text_boundary: bool = True,
+    text_boundary_backend: str = "auto",
 ) -> dict[str, Any]:
     """Detect and crop a document/receipt from an image.
 
@@ -1065,6 +1408,8 @@ def document_crop(
         margin_ratio=margin_ratio,
         quality=quality,
         min_component_area_ratio=min_component_area_ratio,
+        use_text_boundary=use_text_boundary,
+        text_boundary_backend=text_boundary_backend,
     )
     if result.get("ok"):
         return urirun.ok(

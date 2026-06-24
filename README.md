@@ -26,6 +26,9 @@ urirun run smartcrop://host/document/query/crop \
 
 The crop route defaults to `auto_orient=true` and `prefer_portrait=true`, so a
 sideways receipt is saved as a portrait image with horizontal text lines.
+Text-boundary cropping is enabled by default with `text_boundary_backend=auto`
+(`tesseract` today). Use `use_text_boundary=false` or
+`text_boundary_backend=none` to force the geometric cascade.
 
 The result includes:
 
@@ -37,8 +40,18 @@ The result includes:
 - `crop.reason`: why detection was skipped when not reliable.
 
 The detector intentionally prefers a conservative "no crop" over a wrong crop.
-It uses OpenCV first to detect a document quadrilateral, rectify perspective,
-and keep documents that touch the camera frame edge. A Pillow connected-component
-detector remains as a fallback for simple bright-document scenes. Candidates are
-scored using contour shape, text/edge density, and penalties for false positives
-such as bright horizontal background bands.
+When Tesseract is available, it first uses OCR word boxes as a text boundary,
+then expands that boundary to the paper component detected from background
+contrast. This keeps receipt barcodes, logos and low-confidence footer text from
+being cut off. If the document already fills the frame, it keeps the frame
+instead of running a destructive second crop.
+
+The text-boundary backend is intentionally explicit. Unsupported values such as
+`paddleocr` or `doctr` fall back to geometry today; those backends can be added
+behind the same parameter later without changing URI flows.
+
+When OCR boxes are not available, the connector falls back to the geometric
+cascade: OpenCV document quadrilateral/perspective crop, bright-sheet fill-ratio,
+text-region and connected-component thresholds. Candidates are scored using
+contour shape, text/edge density, and penalties for false positives such as
+bright horizontal background bands.

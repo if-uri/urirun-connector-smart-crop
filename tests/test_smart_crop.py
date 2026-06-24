@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -15,10 +17,18 @@ from urirun_connector_smart_crop import (
     document_detect,
     urirun_bindings,
 )
+from urirun_connector_smart_crop.core import _text_boundary_document_crop
 
 ROUTE_CROP = "smartcrop://host/document/query/crop"
 ROUTE_DETECT = "smartcrop://host/document/query/detect"
 ALL_ROUTES = {ROUTE_CROP, ROUTE_DETECT}
+
+
+def _fake_tesseract(monkeypatch, data: dict) -> None:
+    fake = types.ModuleType("pytesseract")
+    fake.Output = types.SimpleNamespace(DICT="dict")
+    fake.image_to_data = lambda _image, output_type=None: data
+    monkeypatch.setitem(sys.modules, "pytesseract", fake)
 
 
 def _receipt_scene(path: Path) -> Path:
@@ -53,6 +63,103 @@ def test_detect_document_crop_writes_crop(tmp_path: Path) -> None:
     assert crop["height"] > 120
     assert crop["box"][0] > 40
     assert crop["method"] in {"opencv-perspective", "connected-component"}
+
+
+def test_text_boundary_keeps_already_cropped_document_frame(monkeypatch, tmp_path: Path) -> None:
+    image = Image.new("RGB", (420, 720), (246, 246, 238))
+    draw = ImageDraw.Draw(image)
+    for y in range(36, 660, 82):
+        draw.line((24, y, 394, y), fill=(20, 20, 20), width=3)
+    source = tmp_path / "already-cropped.jpg"
+    image.save(source)
+    _fake_tesseract(monkeypatch, {
+        "conf": ["91"] * 8,
+        "text": [f"word{i}" for i in range(8)],
+        "left": [28, 44, 26, 38, 30, 34, 40, 32],
+        "top": [34, 120, 220, 310, 400, 500, 585, 642],
+        "width": [330, 300, 350, 320, 345, 330, 310, 340],
+        "height": [28, 30, 28, 30, 28, 30, 28, 28],
+    })
+
+    with Image.open(source) as full:
+        crop = _text_boundary_document_crop(
+            full.convert("RGB"),
+            source,
+            output_path=None,
+            output_dir=None,
+            save=False,
+            auto_orient=True,
+            prefer_portrait=True,
+            margin_ratio=0.035,
+            quality=94,
+        )
+
+    assert crop["ok"] is True
+    assert crop["box"] == [0, 0, 420, 720]
+    assert crop["bboxArea"] == 1.0
+
+
+def test_text_boundary_expands_to_background_document_edges(monkeypatch, tmp_path: Path) -> None:
+    image = Image.new("RGB", (520, 760), (116, 86, 55))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((128, 42, 402, 708), fill=(246, 245, 236))
+    for y in range(92, 430, 58):
+        draw.line((154, y, 374, y), fill=(18, 18, 18), width=4)
+    source = tmp_path / "paper-on-background.jpg"
+    image.save(source)
+    _fake_tesseract(monkeypatch, {
+        "conf": ["88"] * 7,
+        "text": [f"line{i}" for i in range(7)],
+        "left": [154, 160, 152, 166, 158, 162, 155],
+        "top": [84, 140, 198, 254, 312, 368, 420],
+        "width": [210, 190, 220, 185, 205, 198, 200],
+        "height": [24, 24, 24, 24, 24, 24, 24],
+    })
+
+    with Image.open(source) as full:
+        crop = _text_boundary_document_crop(
+            full.convert("RGB"),
+            source,
+            output_path=None,
+            output_dir=None,
+            save=False,
+            auto_orient=True,
+            prefer_portrait=True,
+            margin_ratio=0.035,
+            quality=94,
+        )
+
+    assert crop["ok"] is True
+    assert crop["background"]["ok"] is True
+    assert crop["box"][0] <= 130
+    assert crop["box"][2] >= 400
+    assert crop["box"][3] >= 705
+
+
+def test_text_boundary_backend_can_be_disabled(monkeypatch, tmp_path: Path) -> None:
+    source = _receipt_scene(tmp_path / "receipt.jpg")
+    _fake_tesseract(monkeypatch, {
+        "conf": ["91"] * 6,
+        "text": [f"word{i}" for i in range(6)],
+        "left": [10, 20, 30, 40, 50, 60],
+        "top": [10, 20, 30, 40, 50, 60],
+        "width": [20] * 6,
+        "height": [10] * 6,
+    })
+
+    crop = detect_document_crop(source, save=False, text_boundary_backend="none")
+
+    assert crop["ok"] is True
+    assert crop["method"] != "text-boundary"
+
+
+def test_text_boundary_backend_reports_unsupported_backend(tmp_path: Path) -> None:
+    source = _receipt_scene(tmp_path / "receipt.jpg")
+
+    crop = detect_document_crop(source, save=False, use_text_boundary=True, text_boundary_backend="paddleocr")
+
+    assert crop["ok"] is True
+    assert crop["method"] != "text-boundary"
 
 
 def test_detect_document_crop_ignores_bright_background_band(tmp_path: Path) -> None:
@@ -260,3 +367,57 @@ def test_detect_document_crop_handles_receipt_with_brightness_gradient(tmp_path:
     assert 350 <= cx <= 730 and 960 <= cy <= 1350, f"crop centred on {cx},{cy} (distractor?)"
     assert (y1 - y0) > 250, "crop must span the full receipt height, not just the bright top"
     assert crop["bboxArea"] < 0.4
+
+
+def test_text_boundary_crop_follows_detected_text(tmp_path: Path) -> None:
+    """A real text document is cropped to the union of its text, via Tesseract."""
+    import shutil
+
+    import pytest
+
+    pytest.importorskip("pytesseract")
+    if shutil.which("tesseract") is None:
+        pytest.skip("tesseract binary not installed")
+    from PIL import ImageFont
+
+    image = Image.new("RGB", (760, 1040), (58, 60, 62))  # dark surface
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 170, 610, 880), fill=(249, 248, 241))  # white sheet
+    try:
+        font = ImageFont.load_default(size=34)
+    except TypeError:  # very old Pillow without size arg
+        font = ImageFont.load_default()
+    lines = ["PARAGON FISKALNY", "SKLEP TESTOWY ABC", "RAZEM 42,00 PLN",
+             "KARTA VISA", "DZIEKUJEMY ZAPRASZAMY"]
+    y = 220
+    for line in lines:
+        draw.text((190, y), line, fill=(12, 12, 12), font=font)
+        y += 120
+    source = tmp_path / "textdoc.png"
+    image.save(source)
+
+    crop = detect_document_crop(source, save=False)
+
+    assert crop["ok"] is True
+    if crop["method"] != "text-boundary":
+        pytest.skip(f"tesseract did not detect synthetic text (method={crop['method']})")
+    # Cropped to the text/sheet region, not the whole dark frame.
+    assert crop["box"][0] > 90 and crop["box"][1] > 90
+    assert crop["bboxArea"] < 0.75
+    assert crop["wordCount"] >= 6
+
+
+def test_text_boundary_disabled_falls_back_to_geometry(tmp_path: Path) -> None:
+    """With use_text_boundary=False the geometric cascade still produces a crop."""
+    image = Image.new("RGB", (480, 640), (40, 42, 45))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 160, 330, 470), fill=(247, 246, 236))
+    for y in (200, 240, 280, 330, 380, 430):
+        draw.line((175, y, 305, y), fill=(20, 20, 20), width=4)
+    source = tmp_path / "geom.png"
+    image.save(source)
+
+    crop = detect_document_crop(source, save=False, use_text_boundary=False)
+
+    assert crop["ok"] is True
+    assert crop["method"] != "text-boundary"

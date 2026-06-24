@@ -19,6 +19,7 @@ from urirun_connector_smart_crop import (
     urirun_bindings,
 )
 from urirun_connector_smart_crop.core import (
+    _orient_document_image,
     _partial_edge_document_reason,
     _prefer_geometry_over_text_boundary,
     _text_boundary_document_crop,
@@ -487,6 +488,35 @@ def test_detect_document_crop_auto_orients_sideways_receipt_to_portrait(tmp_path
     assert height > width
     assert crop["orientation"]["angle"] in {90, 270}
     assert crop["orientation"]["rotated"] is True
+
+
+def test_orient_document_image_uses_osd_when_portrait_dimension_is_misleading(monkeypatch) -> None:
+    # A nearly square crop can be geometrically "portrait" while its text is
+    # still sideways. Projection scoring alone then prefers the wrong 0/180
+    # candidates. OSD supplies the text-upright direction and must be allowed to
+    # override the portrait-only pool.
+    image = Image.new("RGB", (120, 124), (245, 245, 238))
+
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._line_orientation_score",
+        lambda _image: {"score": 0.25, "darkFraction": 0.02, "rowPeak": 0.3, "colPeak": 0.05},
+    )
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._tesseract_orientation_correction",
+        lambda _image: {
+            "ok": True,
+            "rotate": 90,  # clockwise tesseract hint -> PIL angle 270
+            "confidence": 2.0,
+            "script": "Latin",
+            "scriptConfidence": 0.8,
+        },
+    )
+
+    oriented, meta = _orient_document_image(image, auto_orient=True, prefer_portrait=True)
+
+    assert meta["angle"] == 270
+    assert meta["osd"]["appliedAngle"] == 270
+    assert oriented.size == (124, 120)
 
 
 def test_document_crop_route_returns_original_when_uncertain(tmp_path: Path) -> None:

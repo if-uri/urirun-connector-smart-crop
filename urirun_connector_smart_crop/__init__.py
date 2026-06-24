@@ -6,6 +6,7 @@ from .core import (
     detect_document_crop,
     document_crop,
     document_detect,
+    orient_document_image,
     urirun_bindings,
 )
 
@@ -14,5 +15,6 @@ __all__ = [
     "detect_document_crop",
     "document_crop",
     "document_detect",
+    "orient_document_image",
     "urirun_bindings",
 ]

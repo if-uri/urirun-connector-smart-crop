@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -153,6 +154,49 @@ def _line_orientation_score(image) -> dict[str, Any]:
         "rowPeak": row_peak,
         "colPeak": col_peak,
     }
+
+
+def _tesseract_orientation_correction(image) -> dict[str, Any]:
+    """Return Tesseract OSD's clockwise rotate hint, when it is available.
+
+    Projection scoring is good at detecting whether text lines are horizontal, but
+    it cannot distinguish 90 from 270 degrees. Tesseract OSD is slower and less
+    reliable on sparse text, so it is used only as an optional correction signal.
+    """
+    try:
+        import pytesseract
+
+        osd = pytesseract.image_to_osd(image, config="--psm 0")
+    except Exception as exc:  # noqa: BLE001 - OSD is best-effort only
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    rotate_match = re.search(r"^\s*Rotate:\s*(\d+)", osd, re.M)
+    confidence_match = re.search(r"^\s*Orientation confidence:\s*([0-9.]+)", osd, re.M)
+    script_match = re.search(r"^\s*Script:\s*(.+)", osd, re.M)
+    script_confidence_match = re.search(r"^\s*Script confidence:\s*([0-9.]+)", osd, re.M)
+    if not rotate_match:
+        return {"ok": False, "error": "tesseract OSD did not report Rotate"}
+    rotate = int(rotate_match.group(1)) % 360
+    confidence = float(confidence_match.group(1)) if confidence_match else 0.0
+    script_confidence = float(script_confidence_match.group(1)) if script_confidence_match else 0.0
+    return {
+        "ok": True,
+        "rotate": rotate,
+        "confidence": confidence,
+        "script": script_match.group(1).strip() if script_match else "",
+        "scriptConfidence": script_confidence,
+    }
+
+
+def _osd_preferred_pil_angle(osd: dict[str, Any]) -> int | None:
+    if not osd.get("ok"):
+        return None
+    # Tesseract's Rotate is clockwise; PIL's positive rotate is counter-clockwise.
+    rotate = int(osd.get("rotate") or 0) % 360
+    confidence = float(osd.get("confidence") or 0.0)
+    script_confidence = float(osd.get("scriptConfidence") or 0.0)
+    if rotate not in {0, 90, 180, 270} or confidence < 0.45 or script_confidence < 0.25:
+        return None
+    return (360 - rotate) % 360
 
 
 def _distance(a: Any, b: Any) -> float:
@@ -758,13 +802,18 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
     if not auto_orient:
         return image, {"enabled": False, "angle": 0, "reason": "disabled", "width": image.size[0], "height": image.size[1]}
 
+    osd = _tesseract_orientation_correction(image)
+    osd_angle = _osd_preferred_pil_angle(osd)
     candidates: list[dict[str, Any]] = []
     for angle in (0, 90, 180, 270):
         rotated = image.rotate(angle, expand=True) if angle else image
         width, height = rotated.size
         projection = _line_orientation_score(rotated)
         portrait_bonus = 0.28 if prefer_portrait and height >= width else 0.0
-        score = float(projection["score"]) + portrait_bonus
+        osd_bonus = 0.0
+        if osd_angle is not None:
+            osd_bonus = 1.15 if angle == osd_angle else 0.0
+        score = float(projection["score"]) + portrait_bonus + osd_bonus
         candidates.append({
             "angle": angle,
             "score": score,
@@ -772,10 +821,11 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
             "height": height,
             "portrait": height >= width,
             "projection": projection,
+            "osdBonus": osd_bonus,
         })
 
     pool = candidates
-    if prefer_portrait:
+    if prefer_portrait and osd_angle is None:
         portrait_candidates = [item for item in candidates if item["portrait"]]
         if portrait_candidates:
             pool = portrait_candidates
@@ -789,6 +839,15 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
         "width": oriented.size[0],
         "height": oriented.size[1],
         "score": round(float(best["score"]), 6),
+        "osd": {
+            "ok": bool(osd.get("ok")),
+            "rotate": osd.get("rotate"),
+            "appliedAngle": osd_angle,
+            "confidence": osd.get("confidence"),
+            "script": osd.get("script"),
+            "scriptConfidence": osd.get("scriptConfidence"),
+            **({"error": osd.get("error")} if osd.get("error") else {}),
+        },
         "candidates": [
             {
                 "angle": item["angle"],
@@ -796,10 +855,16 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
                 "width": item["width"],
                 "height": item["height"],
                 "portrait": item["portrait"],
+                "osdBonus": round(float(item["osdBonus"]), 6),
             }
             for item in candidates
         ],
     }
+
+
+def orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: bool = True) -> tuple[Any, dict[str, Any]]:
+    """Public wrapper for callers that already have a cropped document image."""
+    return _orient_document_image(image, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
 
 
 def _box_containment(inner: Any, outer: Any) -> float:

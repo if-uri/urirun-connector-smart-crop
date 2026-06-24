@@ -23,3 +23,9 @@ def _stub_paddle_detector(request, monkeypatch):
         "urirun_connector_smart_crop.core._get_paddle_detector",
         _unavailable,
     )
+    # The orientation classifier is likewise stubbed off (returns None -> the geometric
+    # orientation cascade runs, which is what these deterministic fixtures exercise).
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._get_paddle_orienter",
+        lambda *_args, **_kwargs: None,
+    )

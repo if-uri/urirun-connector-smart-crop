@@ -199,6 +199,13 @@ def _osd_preferred_pil_angle(osd: dict[str, Any]) -> int | None:
     return (360 - rotate) % 360
 
 
+def _should_use_orientation_osd(image) -> bool:
+    width, height = image.size
+    shortest = max(1, min(width, height))
+    aspect = max(width, height) / float(shortest)
+    return aspect <= 1.35
+
+
 def _distance(a: Any, b: Any) -> float:
     return float(math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
 
@@ -802,7 +809,29 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
     if not auto_orient:
         return image, {"enabled": False, "angle": 0, "reason": "disabled", "width": image.size[0], "height": image.size[1]}
 
-    osd = _tesseract_orientation_correction(image)
+    # A trained orientation classifier is authoritative when available: tesseract OSD fails on
+    # receipts and the geometric row/col score is backwards for narrow documents. Only the
+    # geometric cascade below runs when the model is absent or not confident.
+    paddle = _paddle_document_angle(image)
+    if paddle is not None:
+        angle = int(paddle["angle"])
+        oriented = image.rotate(angle, expand=True) if angle else image
+        return oriented, {
+            "enabled": True,
+            "angle": angle,
+            "rotated": bool(angle),
+            "preferPortrait": prefer_portrait,
+            "source": "paddle-doc-orientation",
+            "score": paddle["score"],
+            "width": oriented.size[0],
+            "height": oriented.size[1],
+        }
+
+    osd = (
+        _tesseract_orientation_correction(image)
+        if _should_use_orientation_osd(image)
+        else {"ok": False, "skipped": "geometry is not near-square"}
+    )
     osd_angle = _osd_preferred_pil_angle(osd)
     candidates: list[dict[str, Any]] = []
     for angle in (0, 90, 180, 270):
@@ -847,6 +876,7 @@ def _orient_document_image(image, *, auto_orient: bool = True, prefer_portrait: 
             "script": osd.get("script"),
             "scriptConfidence": osd.get("scriptConfidence"),
             **({"error": osd.get("error")} if osd.get("error") else {}),
+            **({"skipped": osd.get("skipped")} if osd.get("skipped") else {}),
         },
         "candidates": [
             {
@@ -1230,6 +1260,65 @@ def _get_paddle_detector(model_name: str = "PP-OCRv6_medium_det") -> Any:
         engine = TextDetection(model_name=model_name, enable_mkldnn=False)
         _PADDLE_DETECTOR[model_name] = engine
     return engine
+
+
+_PADDLE_ORIENTER: dict[str, Any] = {}
+
+
+def _get_paddle_orienter(model_name: str = "PP-LCNet_x1_0_doc_ori") -> Any | None:
+    """Return a process-cached PaddleOCR document-orientation classifier (or None).
+
+    A trained 0/90/180/270 classifier — the only reliable orientation signal for receipts,
+    where tesseract OSD fails ("too few characters") and the geometric row/col heuristic is
+    backwards (a narrow receipt's blank side margins make ``colPeak`` dominate ``rowPeak`` at
+    the *upright* angle, so ``rowPeak - colPeak`` rewards laying it on its side). Cached like
+    the detector; ``enable_mkldnn`` off for the same oneDNN/PIR crash reason.
+    """
+    if model_name in _PADDLE_ORIENTER:
+        return _PADDLE_ORIENTER[model_name]
+    try:
+        from paddleocr import DocImgOrientationClassification
+        engine = DocImgOrientationClassification(model_name=model_name, enable_mkldnn=False)
+    except Exception:  # noqa: BLE001 - paddle/model unavailable: fall back to geometry
+        engine = None
+    _PADDLE_ORIENTER[model_name] = engine
+    return engine
+
+
+def _paddle_document_angle(image, *, min_score: float = 0.55) -> dict[str, Any] | None:
+    """Pick the PIL rotation (0/90/180/270) the orientation model judges upright.
+
+    Tries each rotation and keeps the one the model labels ``'0'`` with the highest score
+    (the model is confident about upright-vs-sideways but conflates 0/180 and 90/270, so a
+    direct scan beats trusting a single prediction). Returns ``{angle, score}`` or ``None``
+    when the classifier is unavailable or never confident enough — caller then falls back to
+    the geometric heuristic.
+    """
+    classifier = _get_paddle_orienter()
+    if classifier is None:
+        return None
+    try:
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return None
+    best: tuple[float, int] | None = None
+    for angle in (0, 90, 270, 180):  # 180 last: the model is weakest distinguishing it
+        rotated = image.rotate(angle, expand=True) if angle else image
+        try:
+            result = classifier.predict(np.asarray(rotated.convert("RGB")))[0]
+            label = str(result["label_names"][0])
+            scores = result["scores"]
+            score = float(scores[0][0] if getattr(scores, "ndim", 1) > 1 else scores[0])
+        except Exception:  # noqa: BLE001 - any inference error: abandon paddle, use geometry
+            return None
+        if label == "0":
+            if score >= 0.80:
+                return {"angle": angle, "score": round(score, 4)}
+            if best is None or score > best[0]:
+                best = (score, angle)
+    if best and best[0] >= min_score:
+        return {"angle": best[1], "score": round(best[0], 4)}
+    return None
 
 
 def _paddleocr_text_boxes(full: Any, *, min_lines: int = 3, ocr_max_side: int = 1000) -> dict[str, Any]:

@@ -519,6 +519,30 @@ def test_orient_document_image_uses_osd_when_portrait_dimension_is_misleading(mo
     assert oriented.size == (124, 120)
 
 
+def test_orient_document_image_trusts_paddle_orientation(monkeypatch) -> None:
+    # The trained orientation classifier is authoritative: when it picks an angle, the
+    # geometric/OSD cascade is bypassed entirely. This is the fix for receipts that the
+    # row/col heuristic wrongly laid on their side.
+    image = Image.new("RGB", (124, 120), (245, 245, 238))
+
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._paddle_document_angle",
+        lambda _image, **_kw: {"angle": 90, "score": 0.92},
+    )
+    # If the cascade below ran it would raise; it must not be reached.
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._line_orientation_score",
+        lambda _image: (_ for _ in ()).throw(AssertionError("geometry must not run")),
+    )
+
+    oriented, meta = _orient_document_image(image, auto_orient=True, prefer_portrait=True)
+
+    assert meta["source"] == "paddle-doc-orientation"
+    assert meta["angle"] == 90 and meta["rotated"] is True
+    assert meta["score"] == 0.92
+    assert oriented.size == (120, 124)  # 124x120 rotated 90 -> 120x124
+
+
 def test_document_crop_route_returns_original_when_uncertain(tmp_path: Path) -> None:
     source = tmp_path / "dark.jpg"
     Image.new("RGB", (160, 120), (20, 20, 20)).save(source)

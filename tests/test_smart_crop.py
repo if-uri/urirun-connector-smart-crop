@@ -5,6 +5,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from PIL import Image, ImageDraw
 
 import urirun
@@ -17,7 +18,11 @@ from urirun_connector_smart_crop import (
     document_detect,
     urirun_bindings,
 )
-from urirun_connector_smart_crop.core import _prefer_geometry_over_text_boundary, _text_boundary_document_crop
+from urirun_connector_smart_crop.core import (
+    _partial_edge_document_reason,
+    _prefer_geometry_over_text_boundary,
+    _text_boundary_document_crop,
+)
 
 ROUTE_CROP = "smartcrop://host/document/query/crop"
 ROUTE_DETECT = "smartcrop://host/document/query/detect"
@@ -180,8 +185,68 @@ def test_text_boundary_extends_large_background_component_per_safe_side(monkeypa
     assert crop["backgroundExtendedSides"] == {"left": False, "top": False, "right": True, "bottom": True}
     assert crop["box"][0] > 200
     assert crop["box"][1] > 100
-    assert crop["box"][2] >= 900
-    assert crop["box"][3] == 1000
+    # Right/bottom snap to the detected paper edge (870 / 910) plus only a hairline
+    # safety margin -- no longer over-padded out to the frame on the paper-backed sides.
+    assert crop["box"][2] >= 880
+    assert 910 <= crop["box"][3] <= 970
+
+
+def test_text_boundary_does_not_extend_top_to_frame_touching_background(monkeypatch, tmp_path: Path) -> None:
+    image = Image.new("RGB", (1440, 1440), (118, 96, 72))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((380, 300, 1020, 1280), fill=(247, 246, 238))
+    source = tmp_path / "receipt-with-frame-touching-background.jpg"
+    image.save(source)
+
+    text_boxes = [
+        [590, 344, 796, 387],
+        [458, 377, 920, 426],
+        [471, 415, 920, 456],
+        [435, 456, 612, 490],
+        [440, 1073, 975, 1113],
+        [577, 1113, 829, 1151],
+        [439, 1184, 631, 1221],
+    ]
+
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._detect_text_boxes",
+        lambda *_a, **_kw: {
+            "ok": True,
+            "backend": "paddleocr",
+            "boxes": text_boxes,
+            "wordCount": len(text_boxes),
+            "lineHeight": 40,
+            "clean": True,
+        },
+    )
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._background_box_around_text",
+        lambda *_a, **_kw: {
+            "ok": True,
+            "box": [403, 0, 1440, 1227],
+            "bboxArea": 0.6136,
+            "textContainment": 1.0,
+        },
+    )
+
+    with Image.open(source) as full:
+        crop = _text_boundary_document_crop(
+            full.convert("RGB"),
+            source,
+            output_path=None,
+            output_dir=None,
+            save=False,
+            auto_orient=True,
+            prefer_portrait=True,
+            margin_ratio=0.035,
+            quality=94,
+            backend="paddleocr",
+        )
+
+    assert crop["ok"] is True
+    assert crop["backgroundExtendedSides"]["top"] is False
+    assert crop["box"][1] > 250
+    assert crop["box"][1] < 330
 
 
 def test_geometry_can_win_when_text_boundary_cuts_document_bottom() -> None:
@@ -254,6 +319,24 @@ def test_geometry_does_not_win_when_it_cuts_text_or_is_too_wide() -> None:
     assert _prefer_geometry_over_text_boundary(text, geometry) is False
 
 
+def test_partial_edge_guard_rejects_clipped_strip_but_keeps_wide_edge_document() -> None:
+    clipped = {
+        "box": [1137, 0, 1440, 1440],
+        "originalWidth": 1440,
+        "originalHeight": 1440,
+        "wordCount": 29,
+    }
+    valid_edge_document = {
+        "box": [2, 12, 260, 610],
+        "originalWidth": 420,
+        "originalHeight": 620,
+        "wordCount": 20,
+    }
+
+    assert _partial_edge_document_reason(clipped)
+    assert _partial_edge_document_reason(valid_edge_document) == ""
+
+
 def test_text_boundary_backend_can_be_disabled(monkeypatch, tmp_path: Path) -> None:
     source = _receipt_scene(tmp_path / "receipt.jpg")
     _fake_tesseract(monkeypatch, {
@@ -271,7 +354,19 @@ def test_text_boundary_backend_can_be_disabled(monkeypatch, tmp_path: Path) -> N
     assert crop["method"] != "text-boundary"
 
 
-def test_text_boundary_backend_reports_unsupported_backend(tmp_path: Path) -> None:
+def test_text_boundary_reports_unsupported_backend() -> None:
+    from urirun_connector_smart_crop.core import _detect_text_boxes
+
+    result = _detect_text_boxes(Image.new("RGB", (200, 200), (255, 255, 255)), backend="doctr")
+
+    assert result["ok"] is False
+    assert "unsupported" in result["reason"]
+    assert set(result["supportedBackends"]) == {"auto", "paddleocr", "tesseract", "off"}
+
+
+def test_paddleocr_backend_falls_back_when_unavailable(tmp_path: Path) -> None:
+    # PaddleOCR is stubbed unavailable by the autouse fixture, so an explicit paddleocr
+    # request must fall through to the geometric cascade rather than error.
     source = _receipt_scene(tmp_path / "receipt.jpg")
 
     crop = detect_document_crop(source, save=False, use_text_boundary=True, text_boundary_backend="paddleocr")
@@ -539,3 +634,127 @@ def test_text_boundary_disabled_falls_back_to_geometry(tmp_path: Path) -> None:
 
     assert crop["ok"] is True
     assert crop["method"] != "text-boundary"
+
+
+def _fake_paddle_detector(monkeypatch, polys: list) -> None:
+    """Stub the cached PaddleOCR engine with one returning fixed detection polygons.
+
+    Overrides the autouse `unavailable` stub for this test only.
+    """
+    class _Det:
+        def predict(self, _image):
+            return [{"dt_polys": [list(p) for p in polys]}]
+
+    monkeypatch.setattr(
+        "urirun_connector_smart_crop.core._get_paddle_detector",
+        lambda *a, **k: _Det(),
+    )
+
+
+def test_paddleocr_backend_crops_to_detected_text(monkeypatch, tmp_path: Path) -> None:
+    """The PaddleOCR (line-polygon) path drives a text-boundary crop on the paper sheet."""
+    image = Image.new("RGB", (760, 1040), (60, 62, 64))  # dark surface
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 170, 610, 880), fill=(248, 247, 240))  # white sheet
+    for y in range(230, 740, 120):
+        draw.rectangle((190, y, 420, y + 26), fill=(15, 15, 15))
+    source = tmp_path / "paddle-doc.png"
+    image.save(source)
+
+    # Quad polygons (x,y per corner) as PP-OCRv6 returns them, one per text line.
+    polys = [
+        [[190, y], [420, y], [420, y + 26], [190, y + 26]]
+        for y in range(230, 740, 120)
+    ]
+    _fake_paddle_detector(monkeypatch, polys)
+
+    crop = detect_document_crop(source, save=False, text_boundary_backend="paddleocr")
+
+    assert crop["ok"] is True
+    assert crop["method"] == "text-boundary"
+    assert crop["textBoundaryBackend"] == "paddleocr"
+    assert crop["wordCount"] == len(polys)
+    # Snaps out to the detected white-sheet edges, not the dark frame.
+    assert crop["box"][0] >= 130 and crop["box"][2] <= 630
+    assert crop["bboxArea"] < 0.6
+
+
+def test_paddleocr_partial_edge_text_strip_is_rejected(monkeypatch, tmp_path: Path) -> None:
+    image = Image.new("RGB", (1000, 1000), (92, 88, 82))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((850, 0, 999, 999), fill=(248, 247, 240))
+    for y in range(60, 900, 70):
+        draw.rectangle((880, y, 986, y + 24), fill=(18, 18, 18))
+    source = tmp_path / "partial-edge-strip.png"
+    image.save(source)
+
+    polys = [
+        [[880, y], [986, y], [986, y + 24], [880, y + 24]]
+        for y in range(60, 900, 70)
+    ]
+    _fake_paddle_detector(monkeypatch, polys)
+
+    crop = detect_document_crop(source, save=False, text_boundary_backend="paddleocr")
+
+    assert crop["ok"] is False
+    assert crop.get("partialEdge") is True
+    assert "partial" in crop["reason"]
+
+
+@pytest.mark.real_paddle
+def test_paddleocr_backend_real_engine_detects_text(tmp_path: Path) -> None:
+    """Integration: the actual PaddleOCR detector produces a text-boundary crop.
+
+    Skips cleanly when the package or its model (first run downloads it) is unavailable.
+    """
+    pytest.importorskip("paddleocr")
+    from PIL import ImageFont
+
+    from urirun_connector_smart_crop.core import _get_paddle_detector
+
+    try:
+        _get_paddle_detector()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"paddleocr detector unavailable: {exc}")
+
+    image = Image.new("RGB", (760, 1040), (58, 60, 62))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 170, 610, 880), fill=(249, 248, 241))
+    try:
+        font = ImageFont.load_default(size=34)
+    except TypeError:
+        font = ImageFont.load_default()
+    for i, line in enumerate(["PARAGON FISKALNY", "SKLEP TESTOWY ABC", "RAZEM 42,00 PLN",
+                              "KARTA VISA", "DZIEKUJEMY ZAPRASZAMY"]):
+        draw.text((190, 220 + i * 120), line, fill=(12, 12, 12), font=font)
+    source = tmp_path / "real-paddle.png"
+    image.save(source)
+
+    crop = detect_document_crop(source, save=False, text_boundary_backend="paddleocr")
+
+    if crop["method"] != "text-boundary":
+        pytest.skip(f"paddle detected too little synthetic text (method={crop['method']})")
+    assert crop["textBoundaryBackend"] == "paddleocr"
+    assert crop["box"][0] > 90 and crop["box"][1] > 90
+    assert crop["bboxArea"] < 0.75
+
+
+def test_crop_route_tags_output_as_frozen_artifact(tmp_path: Path) -> None:
+    source = _receipt_scene(tmp_path / "receipt.jpg")
+
+    result = document_crop(image=str(source), output_dir=str(tmp_path))
+
+    assert result["ok"] is True
+    # Shared urirun.tag contract: a finished crop is a frozen artifact, never a live widget.
+    assert result["kind"] == "document-crop"
+    assert result["live"] is False
+
+
+def test_detect_route_tags_output_as_frozen_artifact(tmp_path: Path) -> None:
+    source = _receipt_scene(tmp_path / "receipt.jpg")
+
+    result = document_detect(image=str(source))
+
+    assert result["ok"] is True
+    assert result["kind"] == "crop-detection"
+    assert result["live"] is False

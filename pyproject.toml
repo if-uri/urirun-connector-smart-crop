@@ -14,7 +14,13 @@ dependencies = ["urirun>=0.4.14", "pillow>=10", "numpy>=1.26", "opencv-python-he
 
 [project.optional-dependencies]
 text-boundary = ["pytesseract>=0.3.10"]
+text-boundary-paddle = ["paddleocr>=3.0", "paddlepaddle>=3.0"]
 test = ["pytest>=8", "pillow>=10", "numpy>=1.26", "opencv-python-headless>=4.8"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_paddle: exercises the real PaddleOCR detector (skips if unavailable)",
+]
 
 [project.urls]
 Homepage = "https://connect.ifuri.com/connectors/smart-crop"

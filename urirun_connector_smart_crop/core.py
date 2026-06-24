@@ -850,6 +850,8 @@ def _extend_text_box_to_paper(
     max_side_overshoot: float = 0.5,
     max_top_overshoot: float = 0.45,
     max_bottom_overshoot: float = 0.85,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
 ) -> tuple[list[float], bool]:
     """Extend the text box toward the paper box, per side, only where the paper is a
     modest enlargement of the text.
@@ -865,10 +867,26 @@ def _extend_text_box_to_paper(
     px0, py0, px1, py1 = (float(v) for v in paper_box)
     tw = max(1.0, tx1 - tx0)
     th = max(1.0, ty1 - ty0)
-    nx0 = px0 if (px0 < tx0 and (tx0 - px0) / tw <= max_side_overshoot) else tx0
-    ny0 = py0 if (py0 < ty0 and (ty0 - py0) / th <= max_top_overshoot) else ty0
-    nx1 = px1 if (px1 > tx1 and (px1 - tx1) / tw <= max_side_overshoot) else tx1
-    ny1 = py1 if (py1 > ty1 and (py1 - ty1) / th <= max_bottom_overshoot) else ty1
+    def _allow_extension(overshoot: float, max_overshoot: float, touches_frame: bool) -> bool:
+        # A background component touching the camera frame is often the document merged
+        # with the table/wall. Keep tiny hairline extensions, but do not let such a
+        # component drag the crop out to y=0/x=0 and leave a large slab of background.
+        frame_limit = min(max_overshoot, 0.18) if touches_frame else max_overshoot
+        return overshoot <= frame_limit
+
+    touches_left = frame_width is not None and px0 <= 2
+    touches_right = frame_width is not None and px1 >= frame_width - 3
+    touches_top = frame_height is not None and py0 <= 2
+    touches_bottom = frame_height is not None and py1 >= frame_height - 3
+    left_overshoot = (tx0 - px0) / tw
+    top_overshoot = (ty0 - py0) / th
+    right_overshoot = (px1 - tx1) / tw
+    bottom_overshoot = (py1 - ty1) / th
+
+    nx0 = px0 if (px0 < tx0 and _allow_extension(left_overshoot, max_side_overshoot, touches_left)) else tx0
+    ny0 = py0 if (py0 < ty0 and _allow_extension(top_overshoot, max_top_overshoot, touches_top)) else ty0
+    nx1 = px1 if (px1 > tx1 and _allow_extension(right_overshoot, max_side_overshoot, touches_right)) else tx1
+    ny1 = py1 if (py1 > ty1 and _allow_extension(bottom_overshoot, max_bottom_overshoot, touches_bottom)) else ty1
     extended = (nx0, ny0, nx1, ny1) != (tx0, ty0, tx1, ty1)
     return [nx0, ny0, nx1, ny1], extended
 
@@ -910,6 +928,61 @@ def _background_box_is_safe_for_text_crop(background_box: dict[str, Any], width:
     if touches_frame and (bbox_area > 0.45 or box_width > 0.80 or box_height > 0.80):
         return False, "background component touches frame and is too large"
     return True, ""
+
+
+def _partial_edge_document_reason(result: dict[str, Any], width: int | None = None, height: int | None = None) -> str:
+    """Return a rejection reason when a crop is likely only a clipped edge fragment."""
+    box = result.get("box")
+    if not box:
+        return ""
+    try:
+        ow = int(width or result.get("originalWidth") or 0)
+        oh = int(height or result.get("originalHeight") or 0)
+        left, top, right, bottom = (float(value) for value in box)
+    except (TypeError, ValueError):
+        return ""
+    if ow <= 0 or oh <= 0:
+        return ""
+    crop_width = max(0.0, right - left)
+    crop_height = max(0.0, bottom - top)
+    if crop_width <= 0.0 or crop_height <= 0.0:
+        return "empty crop box"
+
+    width_ratio = crop_width / float(ow)
+    height_ratio = crop_height / float(oh)
+    area_ratio = (crop_width * crop_height) / float(ow * oh)
+    touches_left = left <= 2
+    touches_right = right >= ow - 3
+    touches_top = top <= 2
+    touches_bottom = bottom >= oh - 3
+
+    if (touches_left or touches_right) and width_ratio < 0.34 and height_ratio > 0.82:
+        return "partial document at horizontal frame edge"
+    if (touches_top or touches_bottom) and height_ratio < 0.34 and width_ratio > 0.82:
+        return "partial document at vertical frame edge"
+    if (touches_left or touches_right or touches_top or touches_bottom) and area_ratio < 0.035 and min(width_ratio, height_ratio) < 0.22:
+        return "partial document fragment at frame edge"
+    try:
+        word_count = int(result.get("wordCount") or 0)
+    except (TypeError, ValueError):
+        word_count = 0
+    if word_count >= 12 and (touches_left or touches_right) and width_ratio < 0.42 and area_ratio < 0.28:
+        return "partial text strip at frame edge"
+    return ""
+
+
+def _reject_partial_edge_crop(result: dict[str, Any]) -> dict[str, Any]:
+    if not result.get("ok"):
+        return result
+    reason = _partial_edge_document_reason(result)
+    if not reason:
+        return result
+    return {
+        **result,
+        "ok": False,
+        "reason": reason,
+        "partialEdge": True,
+    }
 
 
 def _text_boundary_should_probe_geometry(result: dict[str, Any]) -> bool:
@@ -1055,6 +1128,106 @@ def _background_box_around_text(full: Any, text_box: Any, *, max_side: int = 700
     }
 
 
+def _median_box_height(boxes: Any) -> float:
+    """Median height of a list of ``[left, top, right, bottom]`` boxes.
+
+    The detected text-line height is a natural, scale-invariant unit for document
+    margins: a sheet's margin scales with its type size, not with the overall size of
+    the text block, so padding by a fixed multiple of this is repeatable across
+    resolutions and document formats.
+    """
+    heights = sorted(max(0.0, float(box[3]) - float(box[1])) for box in boxes)
+    if not heights:
+        return 0.0
+    mid = len(heights) // 2
+    if len(heights) % 2:
+        return heights[mid]
+    return (heights[mid - 1] + heights[mid]) / 2.0
+
+
+_PADDLE_DETECTOR: dict[str, Any] = {}
+
+
+def _get_paddle_detector(model_name: str = "PP-OCRv6_medium_det") -> Any:
+    """Return a process-cached PaddleOCR text-detection engine.
+
+    Construction loads a model (~2s) and is the expensive part, so the engine is
+    memoised for the life of the process (the urirun host stays warm across calls and
+    pays it once). ``enable_mkldnn`` is forced off: the oneDNN/PIR path crashes on this
+    Paddle build (``ConvertPirAttribute2RuntimeAttribute``), so detection runs on the
+    default CPU kernels. Only the detector is loaded -- no recognition/orientation
+    models -- so it returns box geometry and is language-agnostic.
+    """
+    engine = _PADDLE_DETECTOR.get(model_name)
+    if engine is None:
+        from paddleocr import TextDetection
+
+        engine = TextDetection(model_name=model_name, enable_mkldnn=False)
+        _PADDLE_DETECTOR[model_name] = engine
+    return engine
+
+
+def _paddleocr_text_boxes(full: Any, *, min_lines: int = 3, ocr_max_side: int = 1000) -> dict[str, Any]:
+    """Detect text-line boxes with PaddleOCR (PP-OCRv6 detection).
+
+    A trained detector finds every text line across document types and languages and,
+    unlike Tesseract, does not emit stray boxes on background texture -- so the union of
+    its boxes is a clean, repeatable document-text extent that needs no percentile
+    trimming (``clean: True``). Returns line-level boxes, so ``min_lines`` counts lines.
+    Any failure (missing package/model, no network for first download, inference error)
+    returns ``ok: False`` so the caller falls back to Tesseract then the geometric cascade.
+    """
+    try:
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "backend": "paddleocr", "reason": f"numpy unavailable: {exc}"}
+    try:
+        detector = _get_paddle_detector()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "backend": "paddleocr", "reason": f"paddleocr unavailable: {exc}"}
+
+    ow, oh = full.size
+    scale = min(1.0, float(ocr_max_side) / max(ow, oh))
+    analysis = full.resize((max(1, int(ow * scale)), max(1, int(oh * scale)))) if scale < 1.0 else full
+    try:
+        results = detector.predict(np.asarray(analysis.convert("RGB")))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "backend": "paddleocr", "reason": f"paddleocr failed: {exc}"}
+    if not results:
+        return {"ok": False, "backend": "paddleocr", "reason": "no detection result"}
+
+    result0 = results[0]
+    try:
+        polys = result0["dt_polys"]
+    except (TypeError, KeyError):
+        polys = getattr(result0, "dt_polys", None)
+    polys = polys if polys is not None else []
+
+    inv = 1.0 / scale
+    boxes: list[list[float]] = []
+    for poly in polys:
+        pts = np.asarray(poly, dtype="float32").reshape(-1, 2)
+        if pts.shape[0] < 2:
+            continue
+        boxes.append([
+            float(pts[:, 0].min()) * inv,
+            float(pts[:, 1].min()) * inv,
+            float(pts[:, 0].max()) * inv,
+            float(pts[:, 1].max()) * inv,
+        ])
+
+    if len(boxes) < min_lines:
+        return {"ok": False, "backend": "paddleocr", "reason": "too little detected text", "wordCount": len(boxes)}
+    return {
+        "ok": True,
+        "backend": "paddleocr",
+        "boxes": boxes,
+        "wordCount": len(boxes),
+        "lineHeight": _median_box_height(boxes),
+        "clean": True,
+    }
+
+
 def _tesseract_text_boxes(full: Any, *, min_conf: float = 45.0, min_words: int = 6, ocr_max_side: int = 1600) -> dict[str, Any]:
     try:
         import pytesseract
@@ -1088,11 +1261,16 @@ def _tesseract_text_boxes(full: Any, *, min_conf: float = 45.0, min_words: int =
     if len(boxes) < min_words:
         return {"ok": False, "backend": "tesseract", "reason": "too little confident text", "wordCount": len(boxes)}
     inv = 1.0 / scale
+    full_boxes = [[value * inv for value in box] for box in boxes]
     return {
         "ok": True,
         "backend": "tesseract",
-        "boxes": [[value * inv for value in box] for box in boxes],
+        "boxes": full_boxes,
         "wordCount": len(boxes),
+        "lineHeight": _median_box_height(full_boxes),
+        # Word-level boxes include occasional stray detections on background texture, so
+        # the crop math still percentile-trims this backend's extent.
+        "clean": False,
     }
 
 
@@ -1105,18 +1283,26 @@ def _detect_text_boxes(
     ocr_max_side: int = 1600,
 ) -> dict[str, Any]:
     normalized = str(backend or "auto").strip().lower()
-    if normalized in {"", "auto"}:
-        normalized = "tesseract"
     if normalized in {"off", "none", "false", "disabled"}:
         return {"ok": False, "backend": normalized, "reason": "text boundary backend disabled"}
-    if normalized != "tesseract":
-        return {
-            "ok": False,
-            "backend": normalized,
-            "reason": f"unsupported text boundary backend: {normalized}",
-            "supportedBackends": ["auto", "tesseract"],
-        }
-    return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+    if normalized in {"paddle", "paddleocr", "ppocr", "pp-ocr"}:
+        return _paddleocr_text_boxes(full)
+    if normalized == "tesseract":
+        return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+    if normalized in {"", "auto"}:
+        # Prefer the trained detector: it is repeatable across document types/languages
+        # and does not need per-document tuning. Fall back to Tesseract when PaddleOCR or
+        # its model is unavailable, then (via the caller) to the geometric cascade.
+        paddle = _paddleocr_text_boxes(full)
+        if paddle.get("ok"):
+            return paddle
+        return _tesseract_text_boxes(full, min_conf=min_conf, min_words=min_words, ocr_max_side=ocr_max_side)
+    return {
+        "ok": False,
+        "backend": normalized,
+        "reason": f"unsupported text boundary backend: {normalized}",
+        "supportedBackends": ["auto", "paddleocr", "tesseract", "off"],
+    }
 
 
 def _text_boundary_document_crop(
@@ -1135,15 +1321,19 @@ def _text_boundary_document_crop(
     min_words: int = 6,
     ocr_max_side: int = 1600,
 ) -> dict[str, Any]:
-    """Crop a document to the boundary of its detected text (Tesseract word boxes).
+    """Crop a document to the boundary of its detected text.
 
-    This is the most reliable signal for receipts/invoices photographed on a busy
-    surface: the union of the actual text boxes follows the document body instead of
-    chasing the brightest patch, so the crop is neither cut through the middle nor
-    overly tight. Outer edges use a 1st/99th percentile so a stray detection on the
-    background cannot blow the box up to the whole frame. Returns ``ok: False`` (so the
-    caller falls back to the geometric cascade) when Tesseract is unavailable or the
-    frame has too little confident text (e.g. a blank sheet or a synthetic test image).
+    Detection comes from a dedicated, trained model (PaddleOCR by default, Tesseract as
+    fallback) so the result is repeatable across document types and languages without
+    per-image tuning. The union of the text boxes follows the document body instead of
+    chasing the brightest patch, so the crop is neither cut through the middle nor overly
+    tight. The text extent is then snapped out to the detected paper edge per side
+    (``_background_box_around_text``) where that edge is a modest enlargement of the text;
+    the residual margin is a fixed multiple of the detected text-line height, a
+    scale-invariant typographic unit rather than a hand-tuned fraction of the frame.
+    Returns ``ok: False`` (so the caller falls back to the geometric cascade) when no text
+    backend is available or the frame has too little detected text (e.g. a blank sheet or
+    a synthetic test image).
     """
     try:
         import numpy as np
@@ -1161,10 +1351,17 @@ def _text_boundary_document_crop(
     rights = [float(box[2]) for box in boxes]
     bottoms = [float(box[3]) for box in boxes]
 
-    x0 = float(np.percentile(lefts, 1))
-    y0 = float(np.percentile(tops, 1))
-    x1 = float(np.percentile(rights, 99))
-    y1 = float(np.percentile(bottoms, 99))
+    if detected_text.get("clean"):
+        # A trained detector emits no stray background boxes, so the true min/max extent
+        # is trustworthy and keeps every edge line (no percentile trimming needed).
+        x0, y0, x1, y1 = min(lefts), min(tops), max(rights), max(bottoms)
+    else:
+        # Word-level OCR occasionally fires on background texture; trim the extremes so a
+        # single stray box cannot blow the extent up to the whole frame.
+        x0 = float(np.percentile(lefts, 1))
+        y0 = float(np.percentile(tops, 1))
+        x1 = float(np.percentile(rights, 99))
+        y1 = float(np.percentile(bottoms, 99))
     text_box = (x0, y0, x1, y1)
     extended_sides = {"left": False, "top": False, "right": False, "bottom": False}
     background_used = False
@@ -1174,7 +1371,12 @@ def _text_boundary_document_crop(
         # the text (real sheet margin / footer the OCR missed) and keep the text edge
         # where the paper balloons into the background. Avoids both over-loose crops
         # (receipt merged with a textured desk) and over-tight crops (a footer cut off).
-        extended_box, background_used = _extend_text_box_to_paper(text_box, background_box["box"])
+        extended_box, background_used = _extend_text_box_to_paper(
+            text_box,
+            background_box["box"],
+            frame_width=ow,
+            frame_height=oh,
+        )
         if background_used:
             x0, y0, x1, y1 = extended_box
             extended_sides = {
@@ -1192,15 +1394,23 @@ def _text_boundary_document_crop(
     if bw < 40 or bh < 40:
         return {"ok": False, "reason": "text region too small"}
 
-    if background_used:
-        left_pad = bw * max(float(margin_ratio), 0.07 if extended_sides["left"] else 0.18)
-        right_pad = bw * max(float(margin_ratio), 0.07 if extended_sides["right"] else 0.18)
-        top_pad = bh * max(float(margin_ratio), 0.055 if extended_sides["top"] else 0.25)
-        bottom_pad = bh * max(float(margin_ratio), 0.28 if extended_sides["bottom"] else 0.16)
-    else:
-        left_pad = right_pad = bw * max(float(margin_ratio), 0.18)
-        top_pad = bh * max(float(margin_ratio), 0.25)
-        bottom_pad = bh * max(float(margin_ratio), 0.16)
+    # Margin is one detected text line of breathing room (1.6 lines at the bottom, where
+    # totals, QR codes and footers sit below the last line). A side already snapped to a
+    # detected paper edge needs only a hairline safety margin. Using the text-line height
+    # as the unit makes this scale-invariant: it behaves the same on a small receipt and a
+    # full A4 scan, instead of being a hand-tuned fraction of the text block.
+    line_height = float(detected_text.get("lineHeight") or 0.0)
+    if line_height <= 0.0:
+        line_height = max(8.0, _median_box_height(boxes))
+
+    def _side_pad(dim: float, extended: bool, lines: float) -> float:
+        unit = (0.3 if extended else lines) * line_height
+        return max(float(margin_ratio) * dim, unit)
+
+    left_pad = _side_pad(bw, extended_sides["left"], 1.0)
+    right_pad = _side_pad(bw, extended_sides["right"], 1.0)
+    top_pad = _side_pad(bh, extended_sides["top"], 1.0)
+    bottom_pad = _side_pad(bh, extended_sides["bottom"], 1.6)
     box = _clip_box((x0 - left_pad, y0 - top_pad, x1 + right_pad, y1 + bottom_pad), ow, oh)
     bbox_area = ((box[2] - box[0]) * (box[3] - box[1])) / float(ow * oh)
     if (not background_box.get("ok") and bbox_area > 0.82) or bbox_area > 0.985:
@@ -1286,6 +1496,8 @@ def detect_document_crop(
             "originalHeight": original_height,
         }
 
+    partial_rejection: dict[str, Any] | None = None
+
     # Text boundary first: for receipts/invoices the union of detected text boxes follows
     # the document far more reliably than bright-region geometry, which tended to crop
     # through the middle. Falls back to the geometric cascade when there is no usable text.
@@ -1295,13 +1507,16 @@ def detect_document_crop(
             source,
             output_path=output_path,
             output_dir=output_dir,
-            save=save,
+            save=False,
             auto_orient=auto_orient,
             prefer_portrait=prefer_portrait,
             margin_ratio=margin_ratio,
             quality=quality,
             backend=text_boundary_backend,
         )
+        text_boundary_result = _reject_partial_edge_crop(text_boundary_result)
+        if text_boundary_result.get("partialEdge") and partial_rejection is None:
+            partial_rejection = text_boundary_result
         if text_boundary_result.get("ok"):
             if _text_boundary_should_probe_geometry(text_boundary_result):
                 geometry_probe = _opencv_document_crop(
@@ -1317,8 +1532,11 @@ def detect_document_crop(
                     quality=quality,
                     min_component_area_ratio=min_component_area_ratio,
                 )
+                geometry_probe = _reject_partial_edge_crop(geometry_probe)
+                if geometry_probe.get("partialEdge") and partial_rejection is None:
+                    partial_rejection = geometry_probe
                 if _prefer_geometry_over_text_boundary(text_boundary_result, geometry_probe):
-                    return _opencv_document_crop(
+                    return _reject_partial_edge_crop(_opencv_document_crop(
                         full,
                         source,
                         output_path=output_path,
@@ -1330,15 +1548,29 @@ def detect_document_crop(
                         margin_ratio=margin_ratio,
                         quality=quality,
                         min_component_area_ratio=min_component_area_ratio,
-                    )
-            return text_boundary_result
+                    ))
+            if not save:
+                return text_boundary_result
+            saved_text_boundary_result = _text_boundary_document_crop(
+                full,
+                source,
+                output_path=output_path,
+                output_dir=output_dir,
+                save=True,
+                auto_orient=auto_orient,
+                prefer_portrait=prefer_portrait,
+                margin_ratio=margin_ratio,
+                quality=quality,
+                backend=text_boundary_backend,
+            )
+            return _reject_partial_edge_crop(saved_text_boundary_result)
 
     opencv_result = _opencv_document_crop(
         full,
         source,
         output_path=output_path,
         output_dir=output_dir,
-        save=save,
+        save=False,
         auto_orient=auto_orient,
         prefer_portrait=prefer_portrait,
         max_side=max_side,
@@ -1346,6 +1578,9 @@ def detect_document_crop(
         quality=quality,
         min_component_area_ratio=min_component_area_ratio,
     )
+    opencv_result = _reject_partial_edge_crop(opencv_result)
+    if opencv_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = opencv_result
     # A confident, tight opencv crop wins (preserves perspective/edge-document handling).
     # Exception: a large, edge-touching component is often a bright background strip
     # (tape/table/fabric) next to a smaller receipt. Let fill-ratio compete first.
@@ -1353,7 +1588,21 @@ def detect_document_crop(
     opencv_area = float(opencv_result.get("bboxArea") or 1.0) if opencv_result.get("ok") else 1.0
     large_edge_component = bool(opencv_component.get("touchesEdge")) and opencv_area > 0.38
     if opencv_result.get("ok") and opencv_area <= 0.55 and not large_edge_component:
-        return opencv_result
+        if not save:
+            return opencv_result
+        return _reject_partial_edge_crop(_opencv_document_crop(
+            full,
+            source,
+            output_path=output_path,
+            output_dir=output_dir,
+            save=True,
+            auto_orient=auto_orient,
+            prefer_portrait=prefer_portrait,
+            max_side=max_side,
+            margin_ratio=margin_ratio,
+            quality=quality,
+            min_component_area_ratio=min_component_area_ratio,
+        ))
 
     # opencv missing or kept most of the frame (small sheet + big bright distractor). The
     # fill-ratio detector finds the solid paper rectangle; prefer it only when it is clearly
@@ -1363,13 +1612,16 @@ def detect_document_crop(
         source,
         output_path=output_path,
         output_dir=output_dir,
-        save=save,
+        save=False,
         auto_orient=auto_orient,
         prefer_portrait=prefer_portrait,
         max_side=max_side,
         margin_ratio=margin_ratio,
         quality=quality,
     )
+    fill_result = _reject_partial_edge_crop(fill_result)
+    if fill_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = fill_result
     if fill_result.get("ok"):
         fill_area = float(fill_result.get("bboxArea") or 1.0)
         # If the fill-ratio box sits inside a text-rich opencv box, it is a bright
@@ -1381,42 +1633,68 @@ def detect_document_crop(
         contained = _box_containment(fill_result.get("box"), opencv_result.get("box")) if opencv_result.get("ok") else 0.0
         fragment_of_document = contained >= 0.85 and opencv_edge >= 0.05
         if fill_area < 0.5 and not fragment_of_document and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
-            return fill_result
-
-    if opencv_result.get("ok"):
-        # Detectors save eagerly to output_path, so a fill-ratio run that did not win
-        # has already overwritten the file with its (wrong) crop. Re-save the chosen
-        # opencv crop so the file on disk matches the returned result.
-        if save and fill_result.get("ok"):
-            opencv_result = _opencv_document_crop(
+            if not save:
+                return fill_result
+            return _reject_partial_edge_crop(_fill_ratio_document_crop(
                 full,
                 source,
                 output_path=output_path,
                 output_dir=output_dir,
-                save=save,
+                save=True,
                 auto_orient=auto_orient,
                 prefer_portrait=prefer_portrait,
                 max_side=max_side,
                 margin_ratio=margin_ratio,
                 quality=quality,
-                min_component_area_ratio=min_component_area_ratio,
-            )
-        return opencv_result
+            ))
+
+    if opencv_result.get("ok"):
+        if not save:
+            return opencv_result
+        return _reject_partial_edge_crop(_opencv_document_crop(
+            full,
+            source,
+            output_path=output_path,
+            output_dir=output_dir,
+            save=True,
+            auto_orient=auto_orient,
+            prefer_portrait=prefer_portrait,
+            max_side=max_side,
+            margin_ratio=margin_ratio,
+            quality=quality,
+            min_component_area_ratio=min_component_area_ratio,
+        ))
 
     text_region_result = _text_region_document_crop(
         full,
         source,
         output_path=output_path,
         output_dir=output_dir,
-        save=save,
+        save=False,
         auto_orient=auto_orient,
         prefer_portrait=prefer_portrait,
         max_side=max_side,
         margin_ratio=margin_ratio,
         quality=quality,
     )
+    text_region_result = _reject_partial_edge_crop(text_region_result)
+    if text_region_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = text_region_result
     if text_region_result.get("ok"):
-        return text_region_result
+        if not save:
+            return text_region_result
+        return _reject_partial_edge_crop(_text_region_document_crop(
+            full,
+            source,
+            output_path=output_path,
+            output_dir=output_dir,
+            save=True,
+            auto_orient=auto_orient,
+            prefer_portrait=prefer_portrait,
+            max_side=max_side,
+            margin_ratio=margin_ratio,
+            quality=quality,
+        ))
 
     scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
     analysis = full.resize((max(1, int(original_width * scale)), max(1, int(original_height * scale)))) if scale < 1.0 else full
@@ -1433,6 +1711,8 @@ def detect_document_crop(
             min_component_area_ratio=min_component_area_ratio,
         ))
     if not candidates:
+        if partial_rejection is not None:
+            return partial_rejection
         return {
             "ok": False,
             "reason": "no reliable document component",
@@ -1481,6 +1761,29 @@ def detect_document_crop(
         return {"ok": False, "reason": "crop too small", "originalPath": str(source), "box": list(box)}
     if box[0] <= 3 and box[1] <= 3 and box[2] >= original_width - 3 and box[3] >= original_height - 3:
         return {"ok": False, "reason": "crop equals original", "originalPath": str(source), "box": list(box)}
+
+    partial_reason = _partial_edge_document_reason(
+        {
+            "box": list(box),
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "bboxArea": round(bbox_area, 4),
+        }
+    )
+    if partial_reason:
+        return {
+            "ok": False,
+            "reason": partial_reason,
+            "partialEdge": True,
+            "originalPath": str(source),
+            "box": list(box),
+            "coverage": round(coverage, 4),
+            "bboxArea": round(bbox_area, 4),
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "cropWidth": crop_width,
+            "cropHeight": crop_height,
+        }
 
     cropped = full.crop(box)
     oriented, orientation = _orient_document_image(cropped, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
@@ -1549,7 +1852,7 @@ def document_detect(
         text_boundary_backend=text_boundary_backend,
     )
     if result.get("ok"):
-        return urirun.ok(connector=CONNECTOR_ID, crop=result, image=str(_path(image)))
+        return urirun.tag(urirun.ok(connector=CONNECTOR_ID, crop=result, image=str(_path(image))), "crop-detection")
     return urirun.fail(str(result.get("reason", "document not detected")), connector=CONNECTOR_ID, crop=result, image=str(_path(image)))
 
 
@@ -1591,22 +1894,22 @@ def document_crop(
         text_boundary_backend=text_boundary_backend,
     )
     if result.get("ok"):
-        return urirun.ok(
+        return urirun.tag(urirun.ok(
             connector=CONNECTOR_ID,
             image=str(_path(image)),
             path=result.get("path") or str(_path(image)),
             originalPath=result.get("originalPath") or str(_path(image)),
             crop=result,
-        )
+        ), "document-crop")
     if fail_if_uncertain:
         return urirun.fail(str(result.get("reason", "document not detected")), connector=CONNECTOR_ID, image=str(_path(image)), crop=result)
-    return urirun.ok(
+    return urirun.tag(urirun.ok(
         connector=CONNECTOR_ID,
         image=str(_path(image)),
         path=str(_path(image)),
         originalPath=str(_path(image)),
         crop=result,
-    )
+    ), "document-crop")
 
 
 def connector_manifest() -> dict[str, Any]:

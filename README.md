@@ -26,9 +26,11 @@ urirun run smartcrop://host/document/query/crop \
 
 The crop route defaults to `auto_orient=true` and `prefer_portrait=true`, so a
 sideways receipt is saved as a portrait image with horizontal text lines.
-Text-boundary cropping is enabled by default with `text_boundary_backend=auto`
-(`tesseract` today). Use `use_text_boundary=false` or
-`text_boundary_backend=none` to force the geometric cascade.
+Text-boundary cropping is enabled by default with `text_boundary_backend=auto`,
+which prefers the trained **PaddleOCR** detector and falls back to **Tesseract**
+when PaddleOCR or its model is unavailable. Force a specific backend with
+`text_boundary_backend=paddleocr` or `=tesseract`, or use `use_text_boundary=false`
+/ `text_boundary_backend=none` to force the geometric cascade.
 
 The result includes:
 
@@ -38,17 +40,34 @@ The result includes:
 - `crop.box`: `[left, top, right, bottom]` in original image pixels,
 - `crop.orientation`: applied rotation angle and candidate scores,
 - `crop.reason`: why detection was skipped when not reliable.
+- `crop.partialEdge`: true when the detector saw only a clipped fragment of a
+  document at the frame edge; the caller should ask for another frame instead of
+  saving a bad scan.
 
 The detector intentionally prefers a conservative "no crop" over a wrong crop.
-When Tesseract is available, it first uses OCR word boxes as a text boundary,
-then expands that boundary to the paper component detected from background
-contrast. This keeps receipt barcodes, logos and low-confidence footer text from
-being cut off. If the document already fills the frame, it keeps the frame
-instead of running a destructive second crop.
+It first detects text-line boxes with a trained model (PaddleOCR, or Tesseract
+word boxes as fallback), then expands that boundary out to the paper component
+detected from background contrast, per side. The residual margin is a fixed
+multiple of the detected text-line height — a scale-invariant typographic unit,
+not a hand-tuned fraction of the frame — so the same logic holds for a small
+receipt and a full A4 scan. This keeps barcodes, logos and footer text from being
+cut off. If the document already fills the frame, it keeps the frame instead of
+running a destructive second crop.
 
-The text-boundary backend is intentionally explicit. Unsupported values such as
-`paddleocr` or `doctr` fall back to geometry today; those backends can be added
-behind the same parameter later without changing URI flows.
+Paper-background expansion is side-aware. When a background component touches the
+camera frame, only a small extension is allowed on that side; this prevents a
+receipt merged with the table/background from pulling the crop up to `y=0` while
+still keeping real frame-filling documents intact.
+
+Candidate detectors run in probe mode first and write a crop only after the final
+winner passes validation. This prevents a rejected fallback from leaving a stale
+or overly tight `*-receipt-crop.jpg` on disk.
+
+Backends are selectable behind `text_boundary_backend` (`auto`, `paddleocr`,
+`tesseract`, `none`/`off`). Unsupported values fall back to geometry with metadata
+rather than failing the whole crop. PaddleOCR runs detection only (no recognition
+or orientation models), so it is language-agnostic; install it with the
+`text-boundary-paddle` extra.
 
 When OCR boxes are not available, the connector falls back to the geometric
 cascade: OpenCV document quadrilateral/perspective crop, bright-sheet fill-ratio,

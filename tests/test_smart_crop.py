@@ -17,7 +17,7 @@ from urirun_connector_smart_crop import (
     document_detect,
     urirun_bindings,
 )
-from urirun_connector_smart_crop.core import _text_boundary_document_crop
+from urirun_connector_smart_crop.core import _prefer_geometry_over_text_boundary, _text_boundary_document_crop
 
 ROUTE_CROP = "smartcrop://host/document/query/crop"
 ROUTE_DETECT = "smartcrop://host/document/query/detect"
@@ -136,7 +136,7 @@ def test_text_boundary_expands_to_background_document_edges(monkeypatch, tmp_pat
     assert crop["box"][3] >= 705
 
 
-def test_text_boundary_skips_large_background_component_touching_frame(monkeypatch, tmp_path: Path) -> None:
+def test_text_boundary_extends_large_background_component_per_safe_side(monkeypatch, tmp_path: Path) -> None:
     image = Image.new("RGB", (1000, 1000), (122, 94, 66))
     draw = ImageDraw.Draw(image)
     draw.rectangle((285, 155, 835, 900), fill=(244, 241, 226))
@@ -175,13 +175,83 @@ def test_text_boundary_skips_large_background_component_touching_frame(monkeypat
         )
 
     assert crop["ok"] is True
-    assert crop["backgroundUsedForCrop"] is False
-    assert crop["background"]["usedForCrop"] is False
-    assert "too large" in crop["background"]["skipReason"]
+    assert crop["backgroundUsedForCrop"] is True
+    assert crop["background"]["usedForCrop"] is True
+    assert crop["backgroundExtendedSides"] == {"left": False, "top": False, "right": True, "bottom": True}
     assert crop["box"][0] > 200
     assert crop["box"][1] > 100
-    assert crop["box"][2] < 920
-    assert crop["box"][3] < 930
+    assert crop["box"][2] >= 900
+    assert crop["box"][3] == 1000
+
+
+def test_geometry_can_win_when_text_boundary_cuts_document_bottom() -> None:
+    text = {
+        "ok": True,
+        "method": "text-boundary",
+        "box": [440, 0, 1162, 1187],
+        "originalHeight": 1440,
+    }
+    geometry = {
+        "ok": True,
+        "method": "opencv-perspective",
+        "box": [453, 0, 1150, 1439],
+        "originalHeight": 1440,
+    }
+
+    assert _prefer_geometry_over_text_boundary(text, geometry) is True
+
+
+def test_geometry_can_win_when_low_word_text_crop_is_too_narrow() -> None:
+    text = {
+        "ok": True,
+        "method": "text-boundary",
+        "box": [357, 0, 940, 1440],
+        "originalHeight": 1440,
+        "wordCount": 10,
+    }
+    geometry = {
+        "ok": True,
+        "method": "opencv-perspective",
+        "box": [354, 0, 1050, 1439],
+        "originalHeight": 1440,
+    }
+
+    assert _prefer_geometry_over_text_boundary(text, geometry) is True
+
+
+def test_geometry_can_win_when_text_boundary_starts_below_header() -> None:
+    text = {
+        "ok": True,
+        "method": "text-boundary",
+        "box": [383, 446, 985, 1440],
+        "originalHeight": 1440,
+        "wordCount": 29,
+    }
+    geometry = {
+        "ok": True,
+        "method": "opencv-perspective",
+        "box": [377, 96, 1089, 1439],
+        "originalHeight": 1440,
+    }
+
+    assert _prefer_geometry_over_text_boundary(text, geometry) is True
+
+
+def test_geometry_does_not_win_when_it_cuts_text_or_is_too_wide() -> None:
+    text = {
+        "ok": True,
+        "method": "text-boundary",
+        "box": [367, 215, 1119, 1265],
+        "originalHeight": 1440,
+    }
+    geometry = {
+        "ok": True,
+        "method": "opencv-perspective",
+        "box": [0, 0, 1125, 1202],
+        "originalHeight": 1440,
+    }
+
+    assert _prefer_geometry_over_text_boundary(text, geometry) is False
 
 
 def test_text_boundary_backend_can_be_disabled(monkeypatch, tmp_path: Path) -> None:

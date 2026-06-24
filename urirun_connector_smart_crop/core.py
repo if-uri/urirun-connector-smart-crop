@@ -829,10 +829,63 @@ def _box_area(box: Any) -> float:
     return max(0.0, right - left) * max(0.0, bottom - top)
 
 
+def _box_size(box: Any) -> tuple[float, float]:
+    try:
+        left, top, right, bottom = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    return max(0.0, right - left), max(0.0, bottom - top)
+
+
 def _box_union(a: Any, b: Any) -> list[float]:
     left_a, top_a, right_a, bottom_a = (float(v) for v in a)
     left_b, top_b, right_b, bottom_b = (float(v) for v in b)
     return [min(left_a, left_b), min(top_a, top_b), max(right_a, right_b), max(bottom_a, bottom_b)]
+
+
+def _extend_text_box_to_paper(
+    text_box: Any,
+    paper_box: Any,
+    *,
+    max_side_overshoot: float = 0.5,
+    max_top_overshoot: float = 0.45,
+    max_bottom_overshoot: float = 0.85,
+) -> tuple[list[float], bool]:
+    """Extend the text box toward the paper box, per side, only where the paper is a
+    modest enlargement of the text.
+
+    A side where the paper reaches far beyond the text (the receipt merged with a
+    textured/dark background, or OCR missed a faint margin) is left at the text edge,
+    while a side where the paper extends only a little (the real sheet margin, or a
+    footer the OCR missed) is accepted. This is a finer decision than an all-or-nothing
+    accept/reject of the whole paper box, so it neither crops through a footer nor blows
+    the box out to the background. Returns ``(box, extended_any)``.
+    """
+    tx0, ty0, tx1, ty1 = (float(v) for v in text_box)
+    px0, py0, px1, py1 = (float(v) for v in paper_box)
+    tw = max(1.0, tx1 - tx0)
+    th = max(1.0, ty1 - ty0)
+    nx0 = px0 if (px0 < tx0 and (tx0 - px0) / tw <= max_side_overshoot) else tx0
+    ny0 = py0 if (py0 < ty0 and (ty0 - py0) / th <= max_top_overshoot) else ty0
+    nx1 = px1 if (px1 > tx1 and (px1 - tx1) / tw <= max_side_overshoot) else tx1
+    ny1 = py1 if (py1 > ty1 and (py1 - ty1) / th <= max_bottom_overshoot) else ty1
+    extended = (nx0, ny0, nx1, ny1) != (tx0, ty0, tx1, ty1)
+    return [nx0, ny0, nx1, ny1], extended
+
+
+def _box_axis_containment(inner: Any, outer: Any) -> tuple[float, float]:
+    try:
+        il, it, ir, ib = (float(v) for v in inner)
+        ol, ot, orr, ob = (float(v) for v in outer)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    inner_width = max(0.0, ir - il)
+    inner_height = max(0.0, ib - it)
+    if inner_width <= 0.0 or inner_height <= 0.0:
+        return 0.0, 0.0
+    overlap_width = max(0.0, min(ir, orr) - max(il, ol))
+    overlap_height = max(0.0, min(ib, ob) - max(it, ot))
+    return overlap_width / inner_width, overlap_height / inner_height
 
 
 def _clip_box(box: Any, width: int, height: int) -> tuple[int, int, int, int]:
@@ -857,6 +910,65 @@ def _background_box_is_safe_for_text_crop(background_box: dict[str, Any], width:
     if touches_frame and (bbox_area > 0.45 or box_width > 0.80 or box_height > 0.80):
         return False, "background component touches frame and is too large"
     return True, ""
+
+
+def _text_boundary_should_probe_geometry(result: dict[str, Any]) -> bool:
+    if not result.get("ok") or result.get("method") != "text-boundary":
+        return False
+    if not result.get("backgroundUsedForCrop") and result.get("background"):
+        return True
+    box = result.get("box") or []
+    try:
+        top = float(box[1])
+        bottom = float(box[3])
+        height = float(result.get("originalHeight") or 0)
+    except (TypeError, ValueError, IndexError):
+        return False
+    return height > 0 and (top <= 2 or bottom >= height - 3)
+
+
+def _prefer_geometry_over_text_boundary(text_result: dict[str, Any], geometry_result: dict[str, Any]) -> bool:
+    if not geometry_result.get("ok") or geometry_result.get("method") != "opencv-perspective":
+        return False
+    text_box = text_result.get("box")
+    geometry_box = geometry_result.get("box")
+    if not text_box or not geometry_box:
+        return False
+    text_width, text_height = _box_size(text_box)
+    geometry_width, geometry_height = _box_size(geometry_box)
+    if text_width <= 0 or text_height <= 0 or geometry_width <= 0 or geometry_height <= 0:
+        return False
+    horizontal_containment, vertical_containment = _box_axis_containment(text_box, geometry_box)
+    if horizontal_containment < 0.88 or vertical_containment < 0.98:
+        return False
+    width_ratio = geometry_width / text_width
+    height_ratio = geometry_height / text_height
+    area_ratio = _box_area(geometry_box) / max(1.0, _box_area(text_box))
+    try:
+        image_height = float(text_result.get("originalHeight") or geometry_result.get("originalHeight") or 0)
+        text_top = float(text_box[1])
+        text_bottom = float(text_box[3])
+        geometry_top = float(geometry_box[1])
+        geometry_bottom = float(geometry_box[3])
+    except (TypeError, ValueError, IndexError):
+        image_height = 0.0
+        text_top = 0.0
+        text_bottom = 0.0
+        geometry_top = 0.0
+        geometry_bottom = 0.0
+    reaches_bottom = image_height > 0 and geometry_bottom >= image_height - 3 and text_bottom < image_height * 0.90
+    restores_high_header = image_height > 0 and text_top > image_height * 0.25 and geometry_top < text_top - (image_height * 0.12)
+    if width_ratio <= 1.35 and area_ratio <= 1.50 and height_ratio >= 1.05:
+        return True
+    try:
+        word_count = int(text_result.get("wordCount") or 0)
+    except (TypeError, ValueError):
+        word_count = 0
+    if word_count and word_count < 18 and 1.12 <= width_ratio <= 1.55 and area_ratio <= 1.55:
+        return True
+    if restores_high_header and width_ratio <= 1.45 and area_ratio <= 2.20 and height_ratio >= 1.22:
+        return True
+    return reaches_bottom and width_ratio <= 1.40 and area_ratio <= 1.65 and height_ratio >= 1.08
 
 
 def _background_box_around_text(full: Any, text_box: Any, *, max_side: int = 700) -> dict[str, Any]:
@@ -1054,15 +1166,26 @@ def _text_boundary_document_crop(
     x1 = float(np.percentile(rights, 99))
     y1 = float(np.percentile(bottoms, 99))
     text_box = (x0, y0, x1, y1)
+    extended_sides = {"left": False, "top": False, "right": False, "bottom": False}
     background_used = False
     background_box = _background_box_around_text(full, text_box)
     if background_box.get("ok") and background_box.get("box"):
-        background_safe, background_skip_reason = _background_box_is_safe_for_text_crop(background_box, ow, oh)
-        if background_safe:
-            x0, y0, x1, y1 = _box_union(text_box, background_box["box"])
-            background_used = True
+        # Extend per side: accept the paper edge where it is a modest enlargement of
+        # the text (real sheet margin / footer the OCR missed) and keep the text edge
+        # where the paper balloons into the background. Avoids both over-loose crops
+        # (receipt merged with a textured desk) and over-tight crops (a footer cut off).
+        extended_box, background_used = _extend_text_box_to_paper(text_box, background_box["box"])
+        if background_used:
+            x0, y0, x1, y1 = extended_box
+            extended_sides = {
+                "left": x0 < text_box[0],
+                "top": y0 < text_box[1],
+                "right": x1 > text_box[2],
+                "bottom": y1 > text_box[3],
+            }
+            background_box = {**background_box, "usedForCrop": True}
         else:
-            background_box = {**background_box, "usedForCrop": False, "skipReason": background_skip_reason}
+            background_box = {**background_box, "usedForCrop": False, "skipReason": "no safe per-side extension"}
 
     bw = x1 - x0
     bh = y1 - y0
@@ -1070,14 +1193,15 @@ def _text_boundary_document_crop(
         return {"ok": False, "reason": "text region too small"}
 
     if background_used:
-        pad_x = bw * max(float(margin_ratio), 0.07)
-        top_pad = bh * max(float(margin_ratio), 0.055)
-        bottom_pad = bh * max(float(margin_ratio), 0.28)
+        left_pad = bw * max(float(margin_ratio), 0.07 if extended_sides["left"] else 0.18)
+        right_pad = bw * max(float(margin_ratio), 0.07 if extended_sides["right"] else 0.18)
+        top_pad = bh * max(float(margin_ratio), 0.055 if extended_sides["top"] else 0.25)
+        bottom_pad = bh * max(float(margin_ratio), 0.28 if extended_sides["bottom"] else 0.16)
     else:
-        pad_x = bw * max(float(margin_ratio), 0.18)
+        left_pad = right_pad = bw * max(float(margin_ratio), 0.18)
         top_pad = bh * max(float(margin_ratio), 0.25)
         bottom_pad = bh * max(float(margin_ratio), 0.16)
-    box = _clip_box((x0 - pad_x, y0 - top_pad, x1 + pad_x, y1 + bottom_pad), ow, oh)
+    box = _clip_box((x0 - left_pad, y0 - top_pad, x1 + right_pad, y1 + bottom_pad), ow, oh)
     bbox_area = ((box[2] - box[0]) * (box[3] - box[1])) / float(ow * oh)
     if (not background_box.get("ok") and bbox_area > 0.82) or bbox_area > 0.985:
         box = (0, 0, ow, oh)
@@ -1109,6 +1233,7 @@ def _text_boundary_document_crop(
         "wordCount": int(detected_text.get("wordCount") or len(lefts)),
         "background": background_box if background_box.get("ok") else None,
         "backgroundUsedForCrop": background_used,
+        "backgroundExtendedSides": extended_sides,
         "orientation": orientation,
         "originalWidth": ow,
         "originalHeight": oh,
@@ -1178,6 +1303,34 @@ def detect_document_crop(
             backend=text_boundary_backend,
         )
         if text_boundary_result.get("ok"):
+            if _text_boundary_should_probe_geometry(text_boundary_result):
+                geometry_probe = _opencv_document_crop(
+                    full,
+                    source,
+                    output_path=output_path,
+                    output_dir=output_dir,
+                    save=False,
+                    auto_orient=auto_orient,
+                    prefer_portrait=prefer_portrait,
+                    max_side=max_side,
+                    margin_ratio=margin_ratio,
+                    quality=quality,
+                    min_component_area_ratio=min_component_area_ratio,
+                )
+                if _prefer_geometry_over_text_boundary(text_boundary_result, geometry_probe):
+                    return _opencv_document_crop(
+                        full,
+                        source,
+                        output_path=output_path,
+                        output_dir=output_dir,
+                        save=save,
+                        auto_orient=auto_orient,
+                        prefer_portrait=prefer_portrait,
+                        max_side=max_side,
+                        margin_ratio=margin_ratio,
+                        quality=quality,
+                        min_component_area_ratio=min_component_area_ratio,
+                    )
             return text_boundary_result
 
     opencv_result = _opencv_document_crop(

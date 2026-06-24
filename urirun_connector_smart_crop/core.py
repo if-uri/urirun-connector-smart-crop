@@ -845,6 +845,20 @@ def _clip_box(box: Any, width: int, height: int) -> tuple[int, int, int, int]:
     )
 
 
+def _background_box_is_safe_for_text_crop(background_box: dict[str, Any], width: int, height: int) -> tuple[bool, str]:
+    box = background_box.get("box")
+    if not box:
+        return False, "missing box"
+    left, top, right, bottom = (float(value) for value in box)
+    touches_frame = left <= 2 or top <= 2 or right >= width - 3 or bottom >= height - 3
+    bbox_area = float(background_box.get("bboxArea") or (_box_area(box) / float(width * height)))
+    box_width = max(0.0, right - left) / float(max(1, width))
+    box_height = max(0.0, bottom - top) / float(max(1, height))
+    if touches_frame and (bbox_area > 0.45 or box_width > 0.80 or box_height > 0.80):
+        return False, "background component touches frame and is too large"
+    return True, ""
+
+
 def _background_box_around_text(full: Any, text_box: Any, *, max_side: int = 700) -> dict[str, Any]:
     """Find the background-contrast paper component that contains the OCR text box."""
     try:
@@ -1040,18 +1054,29 @@ def _text_boundary_document_crop(
     x1 = float(np.percentile(rights, 99))
     y1 = float(np.percentile(bottoms, 99))
     text_box = (x0, y0, x1, y1)
+    background_used = False
     background_box = _background_box_around_text(full, text_box)
     if background_box.get("ok") and background_box.get("box"):
-        x0, y0, x1, y1 = _box_union(text_box, background_box["box"])
+        background_safe, background_skip_reason = _background_box_is_safe_for_text_crop(background_box, ow, oh)
+        if background_safe:
+            x0, y0, x1, y1 = _box_union(text_box, background_box["box"])
+            background_used = True
+        else:
+            background_box = {**background_box, "usedForCrop": False, "skipReason": background_skip_reason}
 
     bw = x1 - x0
     bh = y1 - y0
     if bw < 40 or bh < 40:
         return {"ok": False, "reason": "text region too small"}
 
-    pad_x = bw * max(float(margin_ratio), 0.07)
-    top_pad = bh * max(float(margin_ratio), 0.055)
-    bottom_pad = bh * max(float(margin_ratio), 0.28)
+    if background_used:
+        pad_x = bw * max(float(margin_ratio), 0.07)
+        top_pad = bh * max(float(margin_ratio), 0.055)
+        bottom_pad = bh * max(float(margin_ratio), 0.28)
+    else:
+        pad_x = bw * max(float(margin_ratio), 0.18)
+        top_pad = bh * max(float(margin_ratio), 0.25)
+        bottom_pad = bh * max(float(margin_ratio), 0.16)
     box = _clip_box((x0 - pad_x, y0 - top_pad, x1 + pad_x, y1 + bottom_pad), ow, oh)
     bbox_area = ((box[2] - box[0]) * (box[3] - box[1])) / float(ow * oh)
     if (not background_box.get("ok") and bbox_area > 0.82) or bbox_area > 0.985:
@@ -1083,6 +1108,7 @@ def _text_boundary_document_crop(
         "textBoundaryBackend": detected_text.get("backend"),
         "wordCount": int(detected_text.get("wordCount") or len(lefts)),
         "background": background_box if background_box.get("ok") else None,
+        "backgroundUsedForCrop": background_used,
         "orientation": orientation,
         "originalWidth": ow,
         "originalHeight": oh,

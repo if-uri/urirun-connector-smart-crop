@@ -136,6 +136,54 @@ def test_text_boundary_expands_to_background_document_edges(monkeypatch, tmp_pat
     assert crop["box"][3] >= 705
 
 
+def test_text_boundary_skips_large_background_component_touching_frame(monkeypatch, tmp_path: Path) -> None:
+    image = Image.new("RGB", (1000, 1000), (122, 94, 66))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((285, 155, 835, 900), fill=(244, 241, 226))
+    source = tmp_path / "receipt-on-edge-connected-background.jpg"
+    image.save(source)
+    _fake_tesseract(monkeypatch, {
+        "conf": ["90"] * 8,
+        "text": [f"item{i}" for i in range(8)],
+        "left": [340, 360, 342, 358, 350, 362, 345, 355],
+        "top": [300, 360, 430, 500, 570, 650, 720, 790],
+        "width": [420, 380, 410, 400, 390, 395, 405, 385],
+        "height": [28] * 8,
+    })
+
+    def fake_background_box(_full, _text_box):
+        return {
+            "ok": True,
+            "box": [100, 0, 870, 910],
+            "bboxArea": 0.7007,
+            "textContainment": 1.0,
+        }
+
+    monkeypatch.setattr("urirun_connector_smart_crop.core._background_box_around_text", fake_background_box)
+
+    with Image.open(source) as full:
+        crop = _text_boundary_document_crop(
+            full.convert("RGB"),
+            source,
+            output_path=None,
+            output_dir=None,
+            save=False,
+            auto_orient=True,
+            prefer_portrait=True,
+            margin_ratio=0.035,
+            quality=94,
+        )
+
+    assert crop["ok"] is True
+    assert crop["backgroundUsedForCrop"] is False
+    assert crop["background"]["usedForCrop"] is False
+    assert "too large" in crop["background"]["skipReason"]
+    assert crop["box"][0] > 200
+    assert crop["box"][1] > 100
+    assert crop["box"][2] < 920
+    assert crop["box"][3] < 930
+
+
 def test_text_boundary_backend_can_be_disabled(monkeypatch, tmp_path: Path) -> None:
     source = _receipt_scene(tmp_path / "receipt.jpg")
     _fake_tesseract(monkeypatch, {

@@ -66,6 +66,29 @@ def test_detect_document_crop_ignores_bright_background_band(tmp_path: Path) -> 
     assert crop["box"][2] < 340
 
 
+def test_detect_document_crop_ignores_connected_bright_tape_and_crops_receipt(tmp_path: Path) -> None:
+    image = Image.new("RGB", (480, 640), (104, 103, 92))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 180, 640), fill=(172, 170, 155))
+    draw.rectangle((92, 0, 480, 64), fill=(190, 184, 158))
+    draw.rectangle((140, 312, 352, 572), fill=(248, 246, 235))
+    for y in (365, 392, 420, 452, 490, 532):
+        draw.line((166, y, 322, y), fill=(24, 24, 24), width=5)
+    draw.text((166, 330), "Polskie ePlatnosci", fill=(24, 24, 24))
+    source = tmp_path / "receipt-with-tape.jpg"
+    image.save(source)
+
+    crop = detect_document_crop(source)
+
+    assert crop["ok"] is True
+    assert crop["method"] in {"text-region", "opencv-perspective"}
+    assert crop["bboxArea"] < 0.45
+    assert crop["box"][0] > 90
+    assert crop["box"][1] > 250
+    assert crop["cropWidth"] < 280
+    assert crop["cropHeight"] < 340
+
+
 def test_detect_document_crop_rectifies_perspective_document(tmp_path: Path) -> None:
     image = Image.new("RGB", (600, 420), (45, 47, 50))
     draw = ImageDraw.Draw(image)

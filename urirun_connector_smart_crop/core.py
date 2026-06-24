@@ -311,6 +311,8 @@ def _opencv_document_crop(
                 continue
             fill = area / max(1.0, quad_area)
             touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
+            if touches_edge and (bbox_ratio > 0.66 or quad_ratio > 0.66):
+                continue
             region = gray[y:y + h, x:x + w]
             region_edges = edges[y:y + h, x:x + w]
             dark_fraction = float(np.count_nonzero(region < 115)) / float(max(1, region.size))
@@ -394,6 +396,353 @@ def _opencv_document_crop(
             "darkFraction": round(float(best["darkFraction"]), 4),
             "edgeDensity": round(float(best["edgeDensity"]), 4),
             "touchesEdge": bool(best["touchesEdge"]),
+        },
+        "orientation": orientation,
+        "originalWidth": original_width,
+        "originalHeight": original_height,
+        "cropWidth": crop_width,
+        "cropHeight": crop_height,
+        "width": oriented.size[0],
+        "height": oriented.size[1],
+    }
+
+
+def _text_region_document_crop(
+    full: Any,
+    source: Path,
+    *,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+    save: bool,
+    auto_orient: bool,
+    prefer_portrait: bool,
+    max_side: int,
+    margin_ratio: float,
+    quality: int,
+) -> dict[str, Any]:
+    """Find receipt-like paper by locating dark text near a bright document body.
+
+    This fallback handles camera scenes where a bright background object touches
+    the receipt, causing plain contour detection to return a near-full-frame
+    connected component.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
+
+    original_width, original_height = full.size
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    rgb = np.asarray(full.convert("RGB"))
+    if scale < 1.0:
+        analysis = cv2.resize(rgb, (max(1, int(original_width * scale)), max(1, int(original_height * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        analysis = rgb
+    ah, aw = analysis.shape[:2]
+    gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY)
+
+    text_candidates: list[dict[str, Any]] = []
+    for dark_threshold in (90, 80, 70, 60):
+        for bright_threshold in (175, 165, 155, 145):
+            dark = cv2.inRange(gray, 0, dark_threshold - 1)
+            bright = cv2.inRange(gray, bright_threshold, 255)
+            near_bright = cv2.dilate(bright, cv2.getStructuringElement(cv2.MORPH_RECT, (33, 33)), iterations=1)
+            mask = cv2.bitwise_and(dark, near_bright)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5)), iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (19, 9)), iterations=2)
+            contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < max(180.0, aw * ah * 0.0025):
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                if w < 24 or h < 18:
+                    continue
+                bbox_ratio = (w * h) / float(aw * ah)
+                if bbox_ratio < 0.0018 or bbox_ratio > 0.42:
+                    continue
+                aspect = w / float(h)
+                if not (0.22 <= aspect <= 7.8):
+                    continue
+                touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
+                if touches_edge and bbox_ratio > 0.18:
+                    continue
+                region = gray[y:y + h, x:x + w]
+                ink_density = float(np.count_nonzero(region < dark_threshold)) / float(max(1, region.size))
+                paper_density = float(np.count_nonzero(region > bright_threshold)) / float(max(1, region.size))
+                if ink_density < 0.006:
+                    continue
+                score = area * min(1.4, ink_density * 14.0) * max(0.25, min(1.2, paper_density * 4.0))
+                if 0.35 <= aspect <= 3.8:
+                    score *= 1.25
+                if y > ah * 0.18:
+                    score *= 1.12
+                text_candidates.append({
+                    "bbox": (x, y, w, h),
+                    "score": score,
+                    "area": area,
+                    "aspect": aspect,
+                    "bboxArea": bbox_ratio,
+                    "darkThreshold": dark_threshold,
+                    "brightThreshold": bright_threshold,
+                    "inkDensity": ink_density,
+                    "paperDensity": paper_density,
+                })
+
+    if not text_candidates:
+        return {"ok": False, "reason": "no receipt-like text region"}
+
+    text = max(text_candidates, key=lambda item: item["score"])
+    tx, ty, tw, th = text["bbox"]
+    paper_candidates: list[dict[str, Any]] = []
+    for bright_threshold in (205, 195, 185, 175, 165):
+        bright = cv2.inRange(gray, bright_threshold, 255)
+        bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)), iterations=2)
+        bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        contours, _hierarchy = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < max(220.0, aw * ah * 0.008):
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            bbox_ratio = (w * h) / float(aw * ah)
+            if bbox_ratio < 0.015 or bbox_ratio > 0.68:
+                continue
+            ix = max(0, min(x + w, tx + tw) - max(x, tx))
+            iy = max(0, min(y + h, ty + th) - max(y, ty))
+            overlap = (ix * iy) / float(max(1, tw * th))
+            if overlap < 0.28:
+                continue
+            aspect = w / float(h)
+            if not (0.18 <= aspect <= 5.0):
+                continue
+            touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
+            if touches_edge and bbox_ratio > 0.36:
+                continue
+            top_overhang = max(0, ty - y) / float(max(1, h))
+            bottom_overhang = max(0, (y + h) - (ty + th)) / float(max(1, h))
+            side_overhang = (
+                max(0, tx - x) + max(0, (x + w) - (tx + tw))
+            ) / float(max(1, w))
+            overhang_penalty = max(0.18, 1.0 - (max(0.0, top_overhang - 0.24) * 1.45) - (max(0.0, side_overhang - 0.72) * 0.65))
+            score = area * overlap * overhang_penalty
+            if top_overhang > 0.48:
+                score *= 0.55
+            if bottom_overhang < 0.03:
+                score *= 0.82
+            if 0.25 <= aspect <= 2.2:
+                score *= 1.18
+            paper_candidates.append({
+                "bbox": (x, y, w, h),
+                "score": score,
+                "area": area,
+                "aspect": aspect,
+                "bboxArea": bbox_ratio,
+                "overlap": overlap,
+                "brightThreshold": bright_threshold,
+                "topOverhang": top_overhang,
+                "bottomOverhang": bottom_overhang,
+                "sideOverhang": side_overhang,
+            })
+
+    if paper_candidates:
+        paper = max(paper_candidates, key=lambda item: item["score"])
+        x, y, w, h = paper["bbox"]
+        component = {"text": text, "paper": paper}
+    else:
+        margin_x = max(8, int(tw * (0.16 + margin_ratio)))
+        top_margin = max(18, int(th * (0.42 + margin_ratio)))
+        bottom_margin = max(12, int(th * (0.16 + margin_ratio)))
+        x = max(0, tx - margin_x)
+        y = max(0, ty - top_margin)
+        w = min(aw - x, tw + (2 * margin_x))
+        h = min(ah - y, th + top_margin + bottom_margin)
+        component = {"text": text, "paper": None}
+
+    pad_x = max(3, int(w * max(0.0, margin_ratio)))
+    pad_y = max(3, int(h * max(0.0, margin_ratio)))
+    left = max(0, x - pad_x)
+    top = max(0, y - pad_y)
+    right = min(aw, x + w + pad_x)
+    bottom = min(ah, y + h + pad_y)
+    inv_scale = 1.0 / scale
+    box = (
+        max(0, int(math.floor(left * inv_scale))),
+        max(0, int(math.floor(top * inv_scale))),
+        min(original_width, int(math.ceil(right * inv_scale))),
+        min(original_height, int(math.ceil(bottom * inv_scale))),
+    )
+    crop_width = box[2] - box[0]
+    crop_height = box[3] - box[1]
+    if crop_width < 50 or crop_height < 50:
+        return {"ok": False, "reason": "text-region crop too small", "box": list(box)}
+    bbox_area = (crop_width * crop_height) / float(original_width * original_height)
+    if bbox_area > 0.72:
+        return {"ok": False, "reason": "text-region crop too large", "box": list(box), "bboxArea": round(bbox_area, 4)}
+
+    cropped = full.crop(box)
+    oriented, orientation = _orient_document_image(cropped, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
+
+    target = ""
+    if save:
+        if output_path:
+            target_path = Path(output_path).expanduser().resolve()
+        elif output_dir:
+            out_dir = Path(output_dir).expanduser().resolve()
+            target_path = out_dir / f"{source.stem}-document-crop.jpg"
+        else:
+            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
+        target = str(target_path)
+
+    return {
+        "ok": True,
+        "method": "text-region",
+        "path": target,
+        "originalPath": str(source),
+        "box": list(box),
+        "coverage": round(float(component["text"]["area"]) / float(aw * ah), 4),
+        "bboxArea": round(bbox_area, 4),
+        "quadArea": None,
+        "threshold": component["text"]["darkThreshold"],
+        "fill": round(float(component["text"]["inkDensity"]), 4),
+        "component": {
+            "area": int(round(float(component["text"]["area"]))),
+            "aspect": round(float(component["text"]["aspect"]), 4),
+            "score": round(float(component["text"]["score"]), 4),
+            "mask": "text-region",
+            "darkThreshold": component["text"]["darkThreshold"],
+            "brightThreshold": component["text"]["brightThreshold"],
+            "inkDensity": round(float(component["text"]["inkDensity"]), 4),
+            "paperDensity": round(float(component["text"]["paperDensity"]), 4),
+            "paper": None if component["paper"] is None else {
+                "area": int(round(float(component["paper"]["area"]))),
+                "aspect": round(float(component["paper"]["aspect"]), 4),
+                "bboxArea": round(float(component["paper"]["bboxArea"]), 4),
+                "overlap": round(float(component["paper"]["overlap"]), 4),
+                "brightThreshold": component["paper"]["brightThreshold"],
+                "topOverhang": round(float(component["paper"]["topOverhang"]), 4),
+                "bottomOverhang": round(float(component["paper"]["bottomOverhang"]), 4),
+                "sideOverhang": round(float(component["paper"]["sideOverhang"]), 4),
+            },
+        },
+        "orientation": orientation,
+        "originalWidth": original_width,
+        "originalHeight": original_height,
+        "cropWidth": crop_width,
+        "cropHeight": crop_height,
+        "width": oriented.size[0],
+        "height": oriented.size[1],
+    }
+
+
+def _fill_ratio_document_crop(
+    full: Any,
+    source: Path,
+    *,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+    save: bool,
+    auto_orient: bool,
+    prefer_portrait: bool,
+    max_side: int,
+    margin_ratio: float,
+    quality: int,
+) -> dict[str, Any]:
+    """Pick the SOLID bright rectangle (the paper sheet) by connected-component fill-ratio.
+
+    Robust to the hard real-world case the contour tier fails on: a small receipt next to a
+    large bright distractor (tape, table edge, light wall). The receipt is a high-fill
+    rectangle; the distractor is an L-shape/streak with a low fill-ratio, so it loses even
+    when it is bigger or brighter. Threshold the brightest pixels at a few high percentiles,
+    morphologically close text gaps, then keep the component maximising fill x area."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
+
+    original_width, original_height = full.size
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    rgb = np.asarray(full.convert("RGB"))
+    analysis = cv2.resize(rgb, (max(1, int(original_width * scale)), max(1, int(original_height * scale))),
+                          interpolation=cv2.INTER_AREA) if scale < 1.0 else rgb
+    ah, aw = analysis.shape[:2]
+    gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    total = float(gray.size)
+    close = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    best: tuple[float, int, int, int, int, float, float] | None = None
+    for pct in (96, 94, 92, 90):
+        thr = float(np.percentile(gray, pct))
+        mask = (gray >= thr).astype("uint8")
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close, iterations=1)
+        count, _labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8)
+        for i in range(1, count):
+            x, y, bw, bh, area = (int(v) for v in stats[i])
+            box = bw * bh
+            if box < 0.01 * total or box > 0.6 * total or bw < 20 or bh < 20:
+                continue
+            touches = x <= 1 or y <= 1 or x + bw >= aw - 1 or y + bh >= ah - 1
+            if touches:
+                continue
+            fill = area / float(box)
+            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
+            if fill > 0.55 and aspect < 6:
+                score = fill * area
+                if best is None or score > best[0]:
+                    best = (score, x, y, bw, bh, fill, aspect)
+    if best is None:
+        return {"ok": False, "reason": "no solid sheet component"}
+
+    score, x, y, bw, bh, fill, aspect = best
+    inv = 1.0 / scale
+    px = int(bw * max(0.0, margin_ratio))
+    py = int(bh * max(0.0, margin_ratio))
+    left = max(0, int((x - px) * inv))
+    top = max(0, int((y - py) * inv))
+    right = min(original_width, int((x + bw + px) * inv))
+    bottom = min(original_height, int((y + bh + py) * inv))
+    crop_width, crop_height = right - left, bottom - top
+    if crop_width < 50 or crop_height < 50:
+        return {"ok": False, "reason": "fill-ratio crop too small"}
+    bbox_area = (crop_width * crop_height) / float(original_width * original_height)
+
+    oriented, orientation = _orient_document_image(full.crop((left, top, right, bottom)),
+                                                   auto_orient=auto_orient, prefer_portrait=prefer_portrait)
+    target = ""
+    if save:
+        if output_path:
+            target_path = Path(output_path).expanduser().resolve()
+        elif output_dir:
+            target_path = Path(output_dir).expanduser().resolve() / f"{source.stem}-document-crop.jpg"
+        else:
+            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
+        target = str(target_path)
+
+    return {
+        "ok": True,
+        "method": "fill-ratio",
+        "path": target,
+        "originalPath": str(source),
+        "box": [left, top, right, bottom],
+        "coverage": round((bw * bh * fill) / total, 4),
+        "bboxArea": round(bbox_area, 4),
+        "quadArea": None,
+        "threshold": None,
+        "fill": round(fill, 4),
+        "component": {
+            "area": int(round(bw * bh * fill)),
+            "aspect": round(aspect, 4),
+            "score": round(score, 4),
+            "mask": "fill-ratio",
+            "touchesEdge": False,
         },
         "orientation": orientation,
         "originalWidth": original_width,
@@ -506,8 +855,48 @@ def detect_document_crop(
         quality=quality,
         min_component_area_ratio=min_component_area_ratio,
     )
+    # A confident, tight opencv crop wins (preserves perspective/edge-document handling).
+    if opencv_result.get("ok") and float(opencv_result.get("bboxArea") or 1.0) <= 0.55:
+        return opencv_result
+
+    # opencv missing or kept most of the frame (small sheet + big bright distractor). The
+    # fill-ratio detector finds the solid paper rectangle; prefer it only when it is clearly
+    # tighter, so a document that legitimately fills the frame still uses opencv-perspective.
+    fill_result = _fill_ratio_document_crop(
+        full,
+        source,
+        output_path=output_path,
+        output_dir=output_dir,
+        save=save,
+        auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait,
+        max_side=max_side,
+        margin_ratio=margin_ratio,
+        quality=quality,
+    )
+    if fill_result.get("ok"):
+        fill_area = float(fill_result.get("bboxArea") or 1.0)
+        opencv_area = float(opencv_result.get("bboxArea") or 1.0) if opencv_result.get("ok") else 1.0
+        if fill_area < 0.5 and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
+            return fill_result
+
     if opencv_result.get("ok"):
         return opencv_result
+
+    text_region_result = _text_region_document_crop(
+        full,
+        source,
+        output_path=output_path,
+        output_dir=output_dir,
+        save=save,
+        auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait,
+        max_side=max_side,
+        margin_ratio=margin_ratio,
+        quality=quality,
+    )
+    if text_region_result.get("ok"):
+        return text_region_result
 
     scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
     analysis = full.resize((max(1, int(original_width * scale)), max(1, int(original_height * scale)))) if scale < 1.0 else full

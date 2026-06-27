@@ -29,16 +29,17 @@ def _path(path: str) -> Path:
     return Path(path).expanduser().resolve()
 
 
-def _candidate_components(
-    raw: bytes,
-    width: int,
-    height: int,
-    threshold: int,
-    *,
-    min_component_area_ratio: float,
-) -> list[dict[str, Any]]:
-    from PIL import Image, ImageFilter
+def _resolve_output_path(source: Path, output_path: str | Path | None, output_dir: str | Path | None) -> Path:
+    """Return the resolved target path for a document-crop JPEG."""
+    if output_path:
+        return Path(output_path).expanduser().resolve()
+    if output_dir:
+        return Path(output_dir).expanduser().resolve() / f"{source.stem}-document-crop.jpg"
+    return source.with_name(f"{source.stem}-document-crop.jpg")
 
+
+def _build_brightness_mask(raw: bytes, width: int, height: int, threshold: int) -> bytearray:
+    """Build a brightness mask: 255 where pixel is bright and near-achromatic, else 0."""
     mask = bytearray(width * height)
     out = 0
     for idx in range(0, len(raw), 3):
@@ -50,8 +51,57 @@ def _candidate_components(
         if lum >= threshold and sat <= 90:
             mask[out] = 255
         out += 1
+    return mask
 
-    closed = Image.frombytes("L", (width, height), bytes(mask)).filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
+
+def _bfs_component(data: bytearray, start: int, width: int, height: int, seen: bytearray) -> tuple[int, int, int, int, int]:
+    """BFS flood-fill from *start*; return (area, minx, maxx, miny, maxy)."""
+    queue = [start]
+    seen[start] = 1
+    area = 0
+    minx = width
+    maxx = 0
+    miny = height
+    maxy = 0
+    for cur in queue:
+        area += 1
+        y, x = divmod(cur, width)
+        if x < minx:
+            minx = x
+        if x > maxx:
+            maxx = x
+        if y < miny:
+            miny = y
+        if y > maxy:
+            maxy = y
+        for nxt in (cur - 1, cur + 1, cur - width, cur + width):
+            if nxt < 0 or nxt >= len(data) or seen[nxt] or not data[nxt]:
+                continue
+            ny, nx = divmod(nxt, width)
+            if abs(nx - x) + abs(ny - y) != 1:
+                continue
+            seen[nxt] = 1
+            queue.append(nxt)
+    return area, minx, maxx, miny, maxy
+
+
+def _component_passes_filter(bw: int, bh: int, aspect: float, bbox_area: float, touches_edge: bool) -> bool:
+    """Return True when a brightness component is a plausible document candidate."""
+    return not (touches_edge or bw < 35 or bh < 35 or not (0.18 <= aspect <= 6.5) or bbox_area < 0.02 or bbox_area > 0.82)
+
+
+def _candidate_components(
+    raw: bytes,
+    width: int,
+    height: int,
+    threshold: int,
+    *,
+    min_component_area_ratio: float,
+) -> list[dict[str, Any]]:
+    from PIL import Image, ImageFilter
+
+    raw_mask = _build_brightness_mask(raw, width, height, threshold)
+    closed = Image.frombytes("L", (width, height), bytes(raw_mask)).filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
     data = bytearray(closed.tobytes())
     seen = bytearray(len(data))
     min_area = max(120, int(width * height * max(0.0001, min_component_area_ratio)))
@@ -60,32 +110,7 @@ def _candidate_components(
     for start, value in enumerate(data):
         if not value or seen[start]:
             continue
-        queue = [start]
-        seen[start] = 1
-        area = 0
-        minx = width
-        maxx = 0
-        miny = height
-        maxy = 0
-        for cur in queue:
-            area += 1
-            y, x = divmod(cur, width)
-            if x < minx:
-                minx = x
-            if x > maxx:
-                maxx = x
-            if y < miny:
-                miny = y
-            if y > maxy:
-                maxy = y
-            for nxt in (cur - 1, cur + 1, cur - width, cur + width):
-                if nxt < 0 or nxt >= len(data) or seen[nxt] or not data[nxt]:
-                    continue
-                ny, nx = divmod(nxt, width)
-                if abs(nx - x) + abs(ny - y) != 1:
-                    continue
-                seen[nxt] = 1
-                queue.append(nxt)
+        area, minx, maxx, miny, maxy = _bfs_component(data, start, width, height, seen)
         if area < min_area:
             continue
 
@@ -94,7 +119,7 @@ def _candidate_components(
         aspect = bw / float(bh)
         bbox_area = (bw * bh) / float(width * height)
         touches_edge = minx <= 2 or miny <= 2 or maxx >= width - 3 or maxy >= height - 3
-        if touches_edge or bw < 35 or bh < 35 or not (0.18 <= aspect <= 6.5) or bbox_area < 0.02 or bbox_area > 0.82:
+        if not _component_passes_filter(bw, bh, aspect, bbox_area, touches_edge):
             continue
 
         fill = area / float(bw * bh)
@@ -279,6 +304,91 @@ def _contour_quad(contour: Any) -> Any | None:
     return None
 
 
+def _opencv_contour_score(
+    area: float,
+    quad_ratio: float,
+    fill: float,
+    mask_name: str,
+    touches_edge: bool,
+    aspect: float,
+    y: int,
+    h: int,
+    ah: int,
+    dark_fraction: float,
+    edge_density: float,
+) -> float:
+    """Compute the composite score for an opencv document contour candidate."""
+    edge_penalty = 0.86 if touches_edge else 1.0
+    top_band_penalty = 0.18 if aspect > 3.0 and y < ah * 0.12 and h < ah * 0.38 else 1.0
+    wide_strip_penalty = 0.48 if aspect > 4.0 else 0.76 if aspect > 3.2 else 1.0
+    content_bonus = max(0.18, min(1.25, (dark_fraction * 18.0) + (edge_density * 10.0)))
+    area_bonus = min(1.0, quad_ratio * 2.4)
+    shape_bonus = min(1.25, max(0.35, fill))
+    mask_bonus = 1.18 if mask_name != "light-region" else 1.0
+    return area * area_bonus * shape_bonus * edge_penalty * top_band_penalty * wide_strip_penalty * content_bonus * mask_bonus
+
+
+def _opencv_process_contour(
+    contour: Any,
+    mask_name: str,
+    gray: Any,
+    edges: Any,
+    aw: int,
+    ah: int,
+    min_area: float,
+) -> "dict[str, Any] | None":
+    """Score a single OpenCV contour as a document candidate; return None if rejected."""
+    import cv2
+    import numpy as np
+
+    area = float(cv2.contourArea(contour))
+    if area < min_area:
+        return None
+    x, y, w, h = cv2.boundingRect(contour)
+    if w < 35 or h < 35:
+        return None
+    bbox_ratio = (w * h) / float(aw * ah)
+    if bbox_ratio < 0.018 or bbox_ratio > 0.985:
+        return None
+    aspect = w / float(h)
+    long_aspect = max(aspect, 1.0 / max(0.001, aspect))
+    if long_aspect > 8.5:
+        return None
+    quad = _contour_quad(contour)
+    if quad is None:
+        return None
+    quad_width, quad_height = _quad_dimensions(quad)
+    if quad_width < 35 or quad_height < 35:
+        return None
+    quad_area = abs(float(cv2.contourArea(quad.astype("float32"))))
+    quad_ratio = quad_area / float(aw * ah)
+    if quad_ratio < 0.018 or quad_ratio > 0.985:
+        return None
+    fill = area / max(1.0, quad_area)
+    touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
+    if touches_edge and (bbox_ratio > 0.66 or quad_ratio > 0.66):
+        return None
+    region = gray[y:y + h, x:x + w]
+    region_edges = edges[y:y + h, x:x + w]
+    dark_fraction = float(np.count_nonzero(region < 115)) / float(max(1, region.size))
+    edge_density = float(np.count_nonzero(region_edges)) / float(max(1, region_edges.size))
+    score = _opencv_contour_score(area, quad_ratio, fill, mask_name, touches_edge, aspect, y, h, ah, dark_fraction, edge_density)
+    return {
+        "mask": mask_name,
+        "area": area,
+        "fill": fill,
+        "score": score,
+        "bbox": (x, y, w, h),
+        "bboxArea": bbox_ratio,
+        "quadArea": quad_ratio,
+        "aspect": aspect,
+        "darkFraction": dark_fraction,
+        "edgeDensity": edge_density,
+        "touchesEdge": touches_edge,
+        "quad": quad,
+    }
+
+
 def _opencv_document_crop(
     full: Any,
     source: Path,
@@ -337,59 +447,9 @@ def _opencv_document_crop(
     for mask_name, mask in masks:
         contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < min_area:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            if w < 35 or h < 35:
-                continue
-            bbox_ratio = (w * h) / float(aw * ah)
-            if bbox_ratio < 0.018 or bbox_ratio > 0.985:
-                continue
-            aspect = w / float(h)
-            long_aspect = max(aspect, 1.0 / max(0.001, aspect))
-            if long_aspect > 8.5:
-                continue
-            quad = _contour_quad(contour)
-            if quad is None:
-                continue
-            quad_width, quad_height = _quad_dimensions(quad)
-            if quad_width < 35 or quad_height < 35:
-                continue
-            quad_area = abs(float(cv2.contourArea(quad.astype("float32"))))
-            quad_ratio = quad_area / float(aw * ah)
-            if quad_ratio < 0.018 or quad_ratio > 0.985:
-                continue
-            fill = area / max(1.0, quad_area)
-            touches_edge = x <= 2 or y <= 2 or x + w >= aw - 3 or y + h >= ah - 3
-            if touches_edge and (bbox_ratio > 0.66 or quad_ratio > 0.66):
-                continue
-            region = gray[y:y + h, x:x + w]
-            region_edges = edges[y:y + h, x:x + w]
-            dark_fraction = float(np.count_nonzero(region < 115)) / float(max(1, region.size))
-            edge_density = float(np.count_nonzero(region_edges)) / float(max(1, region_edges.size))
-            edge_penalty = 0.86 if touches_edge else 1.0
-            top_band_penalty = 0.18 if aspect > 3.0 and y < ah * 0.12 and h < ah * 0.38 else 1.0
-            wide_strip_penalty = 0.48 if aspect > 4.0 else 0.76 if aspect > 3.2 else 1.0
-            content_bonus = max(0.18, min(1.25, (dark_fraction * 18.0) + (edge_density * 10.0)))
-            area_bonus = min(1.0, quad_ratio * 2.4)
-            shape_bonus = min(1.25, max(0.35, fill))
-            mask_bonus = 1.18 if mask_name != "light-region" else 1.0
-            score = area * area_bonus * shape_bonus * edge_penalty * top_band_penalty * wide_strip_penalty * content_bonus * mask_bonus
-            candidates.append({
-                "mask": mask_name,
-                "area": area,
-                "fill": fill,
-                "score": score,
-                "bbox": (x, y, w, h),
-                "bboxArea": bbox_ratio,
-                "quadArea": quad_ratio,
-                "aspect": aspect,
-                "darkFraction": dark_fraction,
-                "edgeDensity": edge_density,
-                "touchesEdge": touches_edge,
-                "quad": quad,
-            })
+            candidate = _opencv_process_contour(contour, mask_name, gray, edges, aw, ah, min_area)
+            if candidate is not None:
+                candidates.append(candidate)
 
     if not candidates:
         return {"ok": False, "reason": "no reliable opencv document contour"}
@@ -416,13 +476,7 @@ def _opencv_document_crop(
 
     target = ""
     if save:
-        if output_path:
-            target_path = Path(output_path).expanduser().resolve()
-        elif output_dir:
-            out_dir = Path(output_dir).expanduser().resolve()
-            target_path = out_dir / f"{source.stem}-document-crop.jpg"
-        else:
-            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path = _resolve_output_path(source, output_path, output_dir)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
         target = str(target_path)
@@ -458,40 +512,10 @@ def _opencv_document_crop(
     }
 
 
-def _text_region_document_crop(
-    full: Any,
-    source: Path,
-    *,
-    output_path: str | Path | None,
-    output_dir: str | Path | None,
-    save: bool,
-    auto_orient: bool,
-    prefer_portrait: bool,
-    max_side: int,
-    margin_ratio: float,
-    quality: int,
-) -> dict[str, Any]:
-    """Find receipt-like paper by locating dark text near a bright document body.
-
-    This fallback handles camera scenes where a bright background object touches
-    the receipt, causing plain contour detection to return a near-full-frame
-    connected component.
-    """
-    try:
-        import cv2
-        import numpy as np
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
-
-    original_width, original_height = full.size
-    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
-    rgb = np.asarray(full.convert("RGB"))
-    if scale < 1.0:
-        analysis = cv2.resize(rgb, (max(1, int(original_width * scale)), max(1, int(original_height * scale))), interpolation=cv2.INTER_AREA)
-    else:
-        analysis = rgb
-    ah, aw = analysis.shape[:2]
-    gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY)
+def _text_region_collect_text_candidates(gray: Any, aw: int, ah: int) -> "list[dict[str, Any]]":
+    """Scan all (dark_threshold, bright_threshold) pairs; return scored text-region candidates."""
+    import cv2
+    import numpy as np
 
     text_candidates: list[dict[str, Any]] = []
     for dark_threshold in (90, 80, 70, 60):
@@ -541,12 +565,15 @@ def _text_region_document_crop(
                     "inkDensity": ink_density,
                     "paperDensity": paper_density,
                 })
+    return text_candidates
 
-    if not text_candidates:
-        return {"ok": False, "reason": "no receipt-like text region"}
 
-    text = max(text_candidates, key=lambda item: item["score"])
-    tx, ty, tw, th = text["bbox"]
+def _text_region_collect_paper_candidates(
+    gray: Any, aw: int, ah: int, tx: int, ty: int, tw: int, th: int
+) -> "list[dict[str, Any]]":
+    """Find bright paper regions that overlap the best text candidate bbox."""
+    import cv2
+
     paper_candidates: list[dict[str, Any]] = []
     for bright_threshold in (205, 195, 185, 175, 165):
         bright = cv2.inRange(gray, bright_threshold, 255)
@@ -597,6 +624,52 @@ def _text_region_document_crop(
                 "bottomOverhang": bottom_overhang,
                 "sideOverhang": side_overhang,
             })
+    return paper_candidates
+
+
+def _text_region_document_crop(
+    full: Any,
+    source: Path,
+    *,
+    output_path: str | Path | None,
+    output_dir: str | Path | None,
+    save: bool,
+    auto_orient: bool,
+    prefer_portrait: bool,
+    max_side: int,
+    margin_ratio: float,
+    quality: int,
+) -> dict[str, Any]:
+    """Find receipt-like paper by locating dark text near a bright document body.
+
+    This fallback handles camera scenes where a bright background object touches
+    the receipt, causing plain contour detection to return a near-full-frame
+    connected component.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"opencv unavailable: {exc}"}
+
+    original_width, original_height = full.size
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    rgb = np.asarray(full.convert("RGB"))
+    if scale < 1.0:
+        analysis = cv2.resize(rgb, (max(1, int(original_width * scale)), max(1, int(original_height * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        analysis = rgb
+    ah, aw = analysis.shape[:2]
+    gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY)
+
+    text_candidates = _text_region_collect_text_candidates(gray, aw, ah)
+
+    if not text_candidates:
+        return {"ok": False, "reason": "no receipt-like text region"}
+
+    text = max(text_candidates, key=lambda item: item["score"])
+    tx, ty, tw, th = text["bbox"]
+    paper_candidates = _text_region_collect_paper_candidates(gray, aw, ah, tx, ty, tw, th)
 
     if paper_candidates:
         paper = max(paper_candidates, key=lambda item: item["score"])
@@ -638,13 +711,7 @@ def _text_region_document_crop(
 
     target = ""
     if save:
-        if output_path:
-            target_path = Path(output_path).expanduser().resolve()
-        elif output_dir:
-            out_dir = Path(output_dir).expanduser().resolve()
-            target_path = out_dir / f"{source.stem}-document-crop.jpg"
-        else:
-            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path = _resolve_output_path(source, output_path, output_dir)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
         target = str(target_path)
@@ -690,6 +757,39 @@ def _text_region_document_crop(
     }
 
 
+def _fill_ratio_find_best_component(
+    gray: Any, total: float, aw: int, ah: int
+) -> "tuple[float, int, int, int, int, float, float] | None":
+    """Scan percentile brightness thresholds; return best (score,x,y,bw,bh,fill,aspect) or None."""
+    import cv2
+    import numpy as np
+
+    close = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    best: "tuple[float, int, int, int, int, float, float] | None" = None
+    for pct in (96, 94, 92, 90):
+        thr = float(np.percentile(gray, pct))
+        mask = (gray >= thr).astype("uint8")
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close, iterations=1)
+        count, _labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8)
+        for i in range(1, count):
+            x, y, bw, bh, area = (int(v) for v in stats[i])
+            box = bw * bh
+            if box < 0.01 * total or box > 0.6 * total or bw < 20 or bh < 20:
+                continue
+            touches = x <= 1 or y <= 1 or x + bw >= aw - 1 or y + bh >= ah - 1
+            if touches:
+                continue
+            fill = area / float(box)
+            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
+            if fill > 0.55 and aspect < 6:
+                score = fill * area
+                if best is None or score > best[0]:
+                    best = (score, x, y, bw, bh, fill, aspect)
+    return best
+
+
 def _fill_ratio_document_crop(
     full: Any,
     source: Path,
@@ -724,29 +824,7 @@ def _fill_ratio_document_crop(
     ah, aw = analysis.shape[:2]
     gray = cv2.cvtColor(analysis, cv2.COLOR_RGB2GRAY).astype(np.float32)
     total = float(gray.size)
-    close = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
-    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    best: tuple[float, int, int, int, int, float, float] | None = None
-    for pct in (96, 94, 92, 90):
-        thr = float(np.percentile(gray, pct))
-        mask = (gray >= thr).astype("uint8")
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close, iterations=1)
-        count, _labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8)
-        for i in range(1, count):
-            x, y, bw, bh, area = (int(v) for v in stats[i])
-            box = bw * bh
-            if box < 0.01 * total or box > 0.6 * total or bw < 20 or bh < 20:
-                continue
-            touches = x <= 1 or y <= 1 or x + bw >= aw - 1 or y + bh >= ah - 1
-            if touches:
-                continue
-            fill = area / float(box)
-            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
-            if fill > 0.55 and aspect < 6:
-                score = fill * area
-                if best is None or score > best[0]:
-                    best = (score, x, y, bw, bh, fill, aspect)
+    best = _fill_ratio_find_best_component(gray, total, aw, ah)
     if best is None:
         return {"ok": False, "reason": "no solid sheet component"}
 
@@ -767,12 +845,7 @@ def _fill_ratio_document_crop(
                                                    auto_orient=auto_orient, prefer_portrait=prefer_portrait)
     target = ""
     if save:
-        if output_path:
-            target_path = Path(output_path).expanduser().resolve()
-        elif output_dir:
-            target_path = Path(output_dir).expanduser().resolve() / f"{source.stem}-document-crop.jpg"
-        else:
-            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path = _resolve_output_path(source, output_path, output_dir)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
         target = str(target_path)
@@ -1025,6 +1098,38 @@ def _background_box_is_safe_for_text_crop(background_box: dict[str, Any], width:
     return True, ""
 
 
+def _edge_fragment_reason(
+    touches_left: bool,
+    touches_right: bool,
+    touches_top: bool,
+    touches_bottom: bool,
+    width_ratio: float,
+    height_ratio: float,
+    area_ratio: float,
+) -> str:
+    """Return a geometry-based rejection reason for an edge-touching crop fragment."""
+    if (touches_left or touches_right) and width_ratio < 0.34 and height_ratio > 0.82:
+        return "partial document at horizontal frame edge"
+    if (touches_top or touches_bottom) and height_ratio < 0.34 and width_ratio > 0.82:
+        return "partial document at vertical frame edge"
+    if (touches_left or touches_right or touches_top or touches_bottom) and area_ratio < 0.035 and min(width_ratio, height_ratio) < 0.22:
+        return "partial document fragment at frame edge"
+    return ""
+
+
+def _text_strip_reason(
+    word_count: int,
+    touches_left: bool,
+    touches_right: bool,
+    width_ratio: float,
+    area_ratio: float,
+) -> str:
+    """Return a rejection reason when a text-dense strip is clipped at the frame edge."""
+    if word_count >= 12 and (touches_left or touches_right) and width_ratio < 0.42 and area_ratio < 0.28:
+        return "partial text strip at frame edge"
+    return ""
+
+
 def _partial_edge_document_reason(result: dict[str, Any], width: int | None = None, height: int | None = None) -> str:
     """Return a rejection reason when a crop is likely only a clipped edge fragment."""
     box = result.get("box")
@@ -1051,19 +1156,14 @@ def _partial_edge_document_reason(result: dict[str, Any], width: int | None = No
     touches_top = top <= 2
     touches_bottom = bottom >= oh - 3
 
-    if (touches_left or touches_right) and width_ratio < 0.34 and height_ratio > 0.82:
-        return "partial document at horizontal frame edge"
-    if (touches_top or touches_bottom) and height_ratio < 0.34 and width_ratio > 0.82:
-        return "partial document at vertical frame edge"
-    if (touches_left or touches_right or touches_top or touches_bottom) and area_ratio < 0.035 and min(width_ratio, height_ratio) < 0.22:
-        return "partial document fragment at frame edge"
+    geom_reason = _edge_fragment_reason(touches_left, touches_right, touches_top, touches_bottom, width_ratio, height_ratio, area_ratio)
+    if geom_reason:
+        return geom_reason
     try:
         word_count = int(result.get("wordCount") or 0)
     except (TypeError, ValueError):
         word_count = 0
-    if word_count >= 12 and (touches_left or touches_right) and width_ratio < 0.42 and area_ratio < 0.28:
-        return "partial text strip at frame edge"
-    return ""
+    return _text_strip_reason(word_count, touches_left, touches_right, width_ratio, area_ratio)
 
 
 def _reject_partial_edge_crop(result: dict[str, Any]) -> dict[str, Any]:
@@ -1095,23 +1195,41 @@ def _text_boundary_should_probe_geometry(result: dict[str, Any]) -> bool:
     return height > 0 and (top <= 2 or bottom >= height - 3)
 
 
-def _prefer_geometry_over_text_boundary(text_result: dict[str, Any], geometry_result: dict[str, Any]) -> bool:
-    if not geometry_result.get("ok") or geometry_result.get("method") != "opencv-perspective":
-        return False
-    text_box = text_result.get("box")
-    geometry_box = geometry_result.get("box")
-    if not text_box or not geometry_box:
-        return False
+def _prefer_geometry_guard_result(geometry_result: dict[str, Any]) -> bool:
+    """Return True when the geometry result is an ok opencv-perspective crop."""
+    return bool(geometry_result.get("ok")) and geometry_result.get("method") == "opencv-perspective"
+
+
+def _prefer_geometry_sizes_ok(text_box: Any, geometry_box: Any) -> bool:
+    """Return True when both boxes have positive dimensions."""
     text_width, text_height = _box_size(text_box)
     geometry_width, geometry_height = _box_size(geometry_box)
-    if text_width <= 0 or text_height <= 0 or geometry_width <= 0 or geometry_height <= 0:
-        return False
+    return text_width > 0 and text_height > 0 and geometry_width > 0 and geometry_height > 0
+
+
+def _prefer_geometry_containment_ok(text_box: Any, geometry_box: Any) -> bool:
+    """Return True when the text box is well-contained inside the geometry box."""
     horizontal_containment, vertical_containment = _box_axis_containment(text_box, geometry_box)
-    if horizontal_containment < 0.88 or vertical_containment < 0.98:
-        return False
+    return horizontal_containment >= 0.88 and vertical_containment >= 0.98
+
+
+def _prefer_geometry_ratios(text_box: Any, geometry_box: Any) -> "tuple[float, float, float]":
+    """Return (width_ratio, height_ratio, area_ratio) between geometry and text boxes."""
+    text_width, text_height = _box_size(text_box)
+    geometry_width, geometry_height = _box_size(geometry_box)
     width_ratio = geometry_width / text_width
     height_ratio = geometry_height / text_height
     area_ratio = _box_area(geometry_box) / max(1.0, _box_area(text_box))
+    return width_ratio, height_ratio, area_ratio
+
+
+def _prefer_geometry_edge_flags(
+    text_result: dict[str, Any],
+    geometry_result: dict[str, Any],
+    text_box: Any,
+    geometry_box: Any,
+) -> "tuple[bool, bool]":
+    """Return (reaches_bottom, restores_high_header) flags for geometry preference logic."""
     try:
         image_height = float(text_result.get("originalHeight") or geometry_result.get("originalHeight") or 0)
         text_top = float(text_box[1])
@@ -1119,19 +1237,36 @@ def _prefer_geometry_over_text_boundary(text_result: dict[str, Any], geometry_re
         geometry_top = float(geometry_box[1])
         geometry_bottom = float(geometry_box[3])
     except (TypeError, ValueError, IndexError):
-        image_height = 0.0
-        text_top = 0.0
-        text_bottom = 0.0
-        geometry_top = 0.0
-        geometry_bottom = 0.0
+        return False, False
     reaches_bottom = image_height > 0 and geometry_bottom >= image_height - 3 and text_bottom < image_height * 0.90
     restores_high_header = image_height > 0 and text_top > image_height * 0.25 and geometry_top < text_top - (image_height * 0.12)
+    return reaches_bottom, restores_high_header
+
+
+def _prefer_geometry_word_count(text_result: dict[str, Any]) -> int:
+    """Return the word count from a text-boundary result, or 0 on error."""
+    try:
+        return int(text_result.get("wordCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prefer_geometry_over_text_boundary(text_result: dict[str, Any], geometry_result: dict[str, Any]) -> bool:
+    if not _prefer_geometry_guard_result(geometry_result):
+        return False
+    text_box = text_result.get("box")
+    geometry_box = geometry_result.get("box")
+    if not text_box or not geometry_box:
+        return False
+    if not _prefer_geometry_sizes_ok(text_box, geometry_box):
+        return False
+    if not _prefer_geometry_containment_ok(text_box, geometry_box):
+        return False
+    width_ratio, height_ratio, area_ratio = _prefer_geometry_ratios(text_box, geometry_box)
+    reaches_bottom, restores_high_header = _prefer_geometry_edge_flags(text_result, geometry_result, text_box, geometry_box)
     if width_ratio <= 1.35 and area_ratio <= 1.50 and height_ratio >= 1.05:
         return True
-    try:
-        word_count = int(text_result.get("wordCount") or 0)
-    except (TypeError, ValueError):
-        word_count = 0
+    word_count = _prefer_geometry_word_count(text_result)
     if word_count and word_count < 18 and 1.12 <= width_ratio <= 1.55 and area_ratio <= 1.55:
         return True
     if restores_high_header and width_ratio <= 1.45 and area_ratio <= 2.20 and height_ratio >= 1.22:
@@ -1466,6 +1601,65 @@ def _detect_text_boxes(
     }
 
 
+def _compute_text_extent(
+    detected_text: dict[str, Any],
+    boxes: list[Any],
+) -> "tuple[float, float, float, float]":
+    """Compute the (x0, y0, x1, y1) text extent from detected boxes.
+
+    Uses exact min/max for clean detectors; 1st/99th percentile trimming for noisy ones.
+    """
+    import numpy as np
+
+    lefts = [float(box[0]) for box in boxes]
+    tops = [float(box[1]) for box in boxes]
+    rights = [float(box[2]) for box in boxes]
+    bottoms = [float(box[3]) for box in boxes]
+    if detected_text.get("clean"):
+        return min(lefts), min(tops), max(rights), max(bottoms)
+    return (
+        float(np.percentile(lefts, 1)),
+        float(np.percentile(tops, 1)),
+        float(np.percentile(rights, 99)),
+        float(np.percentile(bottoms, 99)),
+    )
+
+
+def _apply_background_extension(
+    full: Any,
+    text_box: "tuple[float, float, float, float]",
+    ow: int,
+    oh: int,
+) -> "tuple[float, float, float, float, bool, dict[str, bool], dict[str, Any]]":
+    """Find the paper boundary around the text box and extend per-side where safe.
+
+    Returns (x0, y0, x1, y1, background_used, extended_sides, background_box).
+    """
+    x0, y0, x1, y1 = text_box
+    extended_sides: dict[str, bool] = {"left": False, "top": False, "right": False, "bottom": False}
+    background_box = _background_box_around_text(full, text_box)
+    if not background_box.get("ok") or not background_box.get("box"):
+        return x0, y0, x1, y1, False, extended_sides, background_box
+    extended_box, background_used = _extend_text_box_to_paper(
+        text_box,
+        background_box["box"],
+        frame_width=ow,
+        frame_height=oh,
+    )
+    if background_used:
+        x0, y0, x1, y1 = extended_box
+        extended_sides = {
+            "left": x0 < text_box[0],
+            "top": y0 < text_box[1],
+            "right": x1 > text_box[2],
+            "bottom": y1 > text_box[3],
+        }
+        background_box = {**background_box, "usedForCrop": True}
+    else:
+        background_box = {**background_box, "usedForCrop": False, "skipReason": "no safe per-side extension"}
+    return x0, y0, x1, y1, background_used, extended_sides, background_box
+
+
 def _text_boundary_document_crop(
     full: Any,
     source: Path,
@@ -1507,59 +1701,15 @@ def _text_boundary_document_crop(
         return detected_text
 
     boxes = detected_text.get("boxes") or []
-    lefts = [float(box[0]) for box in boxes]
-    tops = [float(box[1]) for box in boxes]
-    rights = [float(box[2]) for box in boxes]
-    bottoms = [float(box[3]) for box in boxes]
-
-    if detected_text.get("clean"):
-        # A trained detector emits no stray background boxes, so the true min/max extent
-        # is trustworthy and keeps every edge line (no percentile trimming needed).
-        x0, y0, x1, y1 = min(lefts), min(tops), max(rights), max(bottoms)
-    else:
-        # Word-level OCR occasionally fires on background texture; trim the extremes so a
-        # single stray box cannot blow the extent up to the whole frame.
-        x0 = float(np.percentile(lefts, 1))
-        y0 = float(np.percentile(tops, 1))
-        x1 = float(np.percentile(rights, 99))
-        y1 = float(np.percentile(bottoms, 99))
+    x0, y0, x1, y1 = _compute_text_extent(detected_text, boxes)
     text_box = (x0, y0, x1, y1)
-    extended_sides = {"left": False, "top": False, "right": False, "bottom": False}
-    background_used = False
-    background_box = _background_box_around_text(full, text_box)
-    if background_box.get("ok") and background_box.get("box"):
-        # Extend per side: accept the paper edge where it is a modest enlargement of
-        # the text (real sheet margin / footer the OCR missed) and keep the text edge
-        # where the paper balloons into the background. Avoids both over-loose crops
-        # (receipt merged with a textured desk) and over-tight crops (a footer cut off).
-        extended_box, background_used = _extend_text_box_to_paper(
-            text_box,
-            background_box["box"],
-            frame_width=ow,
-            frame_height=oh,
-        )
-        if background_used:
-            x0, y0, x1, y1 = extended_box
-            extended_sides = {
-                "left": x0 < text_box[0],
-                "top": y0 < text_box[1],
-                "right": x1 > text_box[2],
-                "bottom": y1 > text_box[3],
-            }
-            background_box = {**background_box, "usedForCrop": True}
-        else:
-            background_box = {**background_box, "usedForCrop": False, "skipReason": "no safe per-side extension"}
+    x0, y0, x1, y1, background_used, extended_sides, background_box = _apply_background_extension(full, text_box, ow, oh)
 
     bw = x1 - x0
     bh = y1 - y0
     if bw < 40 or bh < 40:
         return {"ok": False, "reason": "text region too small"}
 
-    # Margin is one detected text line of breathing room (1.6 lines at the bottom, where
-    # totals, QR codes and footers sit below the last line). A side already snapped to a
-    # detected paper edge needs only a hairline safety margin. Using the text-line height
-    # as the unit makes this scale-invariant: it behaves the same on a small receipt and a
-    # full A4 scan, instead of being a hand-tuned fraction of the text block.
     line_height = float(detected_text.get("lineHeight") or 0.0)
     if line_height <= 0.0:
         line_height = max(8.0, _median_box_height(boxes))
@@ -1583,12 +1733,7 @@ def _text_boundary_document_crop(
 
     target = ""
     if save:
-        if output_path:
-            target_path = Path(output_path).expanduser().resolve()
-        elif output_dir:
-            target_path = Path(output_dir).expanduser().resolve() / f"{source.stem}-document-crop.jpg"
-        else:
-            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path = _resolve_output_path(source, output_path, output_dir)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
         target = str(target_path)
@@ -1601,7 +1746,7 @@ def _text_boundary_document_crop(
         "box": list(box),
         "bboxArea": round(bbox_area, 4),
         "textBoundaryBackend": detected_text.get("backend"),
-        "wordCount": int(detected_text.get("wordCount") or len(lefts)),
+        "wordCount": int(detected_text.get("wordCount") or len(boxes)),
         "background": background_box if background_box.get("ok") else None,
         "backgroundUsedForCrop": background_used,
         "backgroundExtendedSides": extended_sides,
@@ -1615,262 +1760,185 @@ def _text_boundary_document_crop(
     }
 
 
-def detect_document_crop(
-    image: str | Path,
-    *,
-    output_path: str | Path | None = None,
-    output_dir: str | Path | None = None,
-    save: bool = True,
-    auto_orient: bool = True,
-    prefer_portrait: bool = True,
-    max_side: int = 700,
-    margin_ratio: float = 0.035,
-    quality: int = 94,
-    min_component_area_ratio: float = 0.004,
-    use_text_boundary: bool = True,
-    text_boundary_backend: str = "auto",
-) -> dict[str, Any]:
-    """Detect and optionally write a cropped document image.
+def _ddc_geometry_cascade(
+    full: Any,
+    source: Path,
+    partial_rejection: "dict[str, Any] | None",
+    save: bool,
+    kwargs_opencv: dict[str, Any],
+    kwargs_fill: dict[str, Any],
+    kwargs_text_region: dict[str, Any],
+) -> "tuple[dict[str, Any] | None, dict[str, Any] | None]":
+    """Run opencv → fill-ratio → opencv-fallback → text-region; return (early_result | None, partial_rejection)."""
+    opencv_result = _reject_partial_edge_crop(_opencv_document_crop(full, source, save=False, **kwargs_opencv))
+    if opencv_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = opencv_result
+    opencv_area, opencv_component, large_edge_component = _ddc_opencv_result_params(opencv_result)
+    if opencv_result.get("ok") and opencv_area <= 0.55 and not large_edge_component:
+        if not save:
+            return opencv_result, partial_rejection
+        return _reject_partial_edge_crop(_opencv_document_crop(full, source, save=True, **kwargs_opencv)), partial_rejection
 
-    Returns a metadata dict. ``ok`` is true only when a reliable crop is written
-    or, with ``save=False``, when a reliable box is detected.
-    """
+    fill_result = _reject_partial_edge_crop(_fill_ratio_document_crop(full, source, save=False, **kwargs_fill))
+    if fill_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = fill_result
+    if fill_result.get("ok") and _ddc_should_prefer_fill(fill_result, opencv_result, opencv_component, opencv_area):
+        if not save:
+            return fill_result, partial_rejection
+        return _reject_partial_edge_crop(_fill_ratio_document_crop(full, source, save=True, **kwargs_fill)), partial_rejection
+
+    if opencv_result.get("ok"):
+        if not save:
+            return opencv_result, partial_rejection
+        return _reject_partial_edge_crop(_opencv_document_crop(full, source, save=True, **kwargs_opencv)), partial_rejection
+
+    text_region_result = _reject_partial_edge_crop(_text_region_document_crop(full, source, save=False, **kwargs_text_region))
+    if text_region_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = text_region_result
+    if text_region_result.get("ok"):
+        if not save:
+            return text_region_result, partial_rejection
+        return _reject_partial_edge_crop(_text_region_document_crop(full, source, save=True, **kwargs_text_region)), partial_rejection
+
+    return None, partial_rejection
+
+
+def _ddc_text_boundary_branch(
+    full: Any,
+    source: Path,
+    partial_rejection: "dict[str, Any] | None",
+    save: bool,
+    kwargs_opencv: dict[str, Any],
+    *,
+    output_path: "str | Path | None",
+    output_dir: "str | Path | None",
+    auto_orient: bool,
+    prefer_portrait: bool,
+    margin_ratio: float,
+    quality: int,
+    text_boundary_backend: str,
+) -> "tuple[dict[str, Any] | None, dict[str, Any] | None]":
+    """Run the text-boundary tier; return (early_result | None, updated_partial_rejection)."""
+    text_boundary_result = _text_boundary_document_crop(
+        full, source, save=False, margin_ratio=margin_ratio, quality=quality,
+        output_path=output_path, output_dir=output_dir,
+        auto_orient=auto_orient, prefer_portrait=prefer_portrait, backend=text_boundary_backend,
+    )
+    text_boundary_result = _reject_partial_edge_crop(text_boundary_result)
+    if text_boundary_result.get("partialEdge") and partial_rejection is None:
+        partial_rejection = text_boundary_result
+    if not text_boundary_result.get("ok"):
+        return None, partial_rejection
+    if _text_boundary_should_probe_geometry(text_boundary_result):
+        geometry_probe = _reject_partial_edge_crop(_opencv_document_crop(full, source, save=False, **kwargs_opencv))
+        if geometry_probe.get("partialEdge") and partial_rejection is None:
+            partial_rejection = geometry_probe
+        if _prefer_geometry_over_text_boundary(text_boundary_result, geometry_probe):
+            return _reject_partial_edge_crop(_opencv_document_crop(full, source, save=save, **kwargs_opencv)), partial_rejection
+    if not save:
+        return text_boundary_result, partial_rejection
+    return _reject_partial_edge_crop(_text_boundary_document_crop(
+        full, source, save=True, margin_ratio=margin_ratio, quality=quality,
+        output_path=output_path, output_dir=output_dir,
+        auto_orient=auto_orient, prefer_portrait=prefer_portrait, backend=text_boundary_backend,
+    )), partial_rejection
+
+
+def _ddc_load_image(image_path: "str | Path") -> "tuple[Any, Path, int, int] | dict[str, Any]":
+    """Load and validate the source image; return (full, source, width, height) or an error dict."""
     from PIL import Image, ImageOps
 
-    source = Path(image).expanduser().resolve()
+    source = Path(image_path).expanduser().resolve()
     if not source.is_file():
         return {"ok": False, "reason": f"image not found: {source}", "originalPath": str(source)}
-
     try:
         with Image.open(source) as opened:
             full = ImageOps.exif_transpose(opened).convert("RGB")
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"image decode failed: {exc}", "originalPath": str(source)}
+    w, h = full.size
+    if w < 80 or h < 80:
+        return {"ok": False, "reason": "image too small", "originalPath": str(source), "originalWidth": w, "originalHeight": h}
+    return full, source, w, h
 
-    original_width, original_height = full.size
-    if original_width < 80 or original_height < 80:
-        return {
-            "ok": False,
-            "reason": "image too small",
-            "originalPath": str(source),
-            "originalWidth": original_width,
-            "originalHeight": original_height,
-        }
 
-    partial_rejection: dict[str, Any] | None = None
-
-    # Text boundary first: for receipts/invoices the union of detected text boxes follows
-    # the document far more reliably than bright-region geometry, which tended to crop
-    # through the middle. Falls back to the geometric cascade when there is no usable text.
-    if use_text_boundary:
-        text_boundary_result = _text_boundary_document_crop(
-            full,
-            source,
-            output_path=output_path,
-            output_dir=output_dir,
-            save=False,
-            auto_orient=auto_orient,
-            prefer_portrait=prefer_portrait,
-            margin_ratio=margin_ratio,
-            quality=quality,
-            backend=text_boundary_backend,
-        )
-        text_boundary_result = _reject_partial_edge_crop(text_boundary_result)
-        if text_boundary_result.get("partialEdge") and partial_rejection is None:
-            partial_rejection = text_boundary_result
-        if text_boundary_result.get("ok"):
-            if _text_boundary_should_probe_geometry(text_boundary_result):
-                geometry_probe = _opencv_document_crop(
-                    full,
-                    source,
-                    output_path=output_path,
-                    output_dir=output_dir,
-                    save=False,
-                    auto_orient=auto_orient,
-                    prefer_portrait=prefer_portrait,
-                    max_side=max_side,
-                    margin_ratio=margin_ratio,
-                    quality=quality,
-                    min_component_area_ratio=min_component_area_ratio,
-                )
-                geometry_probe = _reject_partial_edge_crop(geometry_probe)
-                if geometry_probe.get("partialEdge") and partial_rejection is None:
-                    partial_rejection = geometry_probe
-                if _prefer_geometry_over_text_boundary(text_boundary_result, geometry_probe):
-                    return _reject_partial_edge_crop(_opencv_document_crop(
-                        full,
-                        source,
-                        output_path=output_path,
-                        output_dir=output_dir,
-                        save=save,
-                        auto_orient=auto_orient,
-                        prefer_portrait=prefer_portrait,
-                        max_side=max_side,
-                        margin_ratio=margin_ratio,
-                        quality=quality,
-                        min_component_area_ratio=min_component_area_ratio,
-                    ))
-            if not save:
-                return text_boundary_result
-            saved_text_boundary_result = _text_boundary_document_crop(
-                full,
-                source,
-                output_path=output_path,
-                output_dir=output_dir,
-                save=True,
-                auto_orient=auto_orient,
-                prefer_portrait=prefer_portrait,
-                margin_ratio=margin_ratio,
-                quality=quality,
-                backend=text_boundary_backend,
-            )
-            return _reject_partial_edge_crop(saved_text_boundary_result)
-
-    opencv_result = _opencv_document_crop(
-        full,
-        source,
-        output_path=output_path,
-        output_dir=output_dir,
-        save=False,
-        auto_orient=auto_orient,
-        prefer_portrait=prefer_portrait,
-        max_side=max_side,
-        margin_ratio=margin_ratio,
-        quality=quality,
-        min_component_area_ratio=min_component_area_ratio,
-    )
-    opencv_result = _reject_partial_edge_crop(opencv_result)
-    if opencv_result.get("partialEdge") and partial_rejection is None:
-        partial_rejection = opencv_result
-    # A confident, tight opencv crop wins (preserves perspective/edge-document handling).
-    # Exception: a large, edge-touching component is often a bright background strip
-    # (tape/table/fabric) next to a smaller receipt. Let fill-ratio compete first.
+def _ddc_opencv_result_params(opencv_result: dict[str, Any]) -> "tuple[float, dict[str, Any], bool]":
+    """Return (opencv_area, opencv_component, large_edge_component) from an opencv result."""
     opencv_component = opencv_result.get("component") if isinstance(opencv_result.get("component"), dict) else {}
     opencv_area = float(opencv_result.get("bboxArea") or 1.0) if opencv_result.get("ok") else 1.0
     large_edge_component = bool(opencv_component.get("touchesEdge")) and opencv_area > 0.38
-    if opencv_result.get("ok") and opencv_area <= 0.55 and not large_edge_component:
-        if not save:
-            return opencv_result
-        return _reject_partial_edge_crop(_opencv_document_crop(
-            full,
-            source,
-            output_path=output_path,
-            output_dir=output_dir,
-            save=True,
-            auto_orient=auto_orient,
-            prefer_portrait=prefer_portrait,
-            max_side=max_side,
-            margin_ratio=margin_ratio,
-            quality=quality,
-            min_component_area_ratio=min_component_area_ratio,
-        ))
+    return opencv_area, opencv_component, large_edge_component
 
-    # opencv missing or kept most of the frame (small sheet + big bright distractor). The
-    # fill-ratio detector finds the solid paper rectangle; prefer it only when it is clearly
-    # tighter, so a document that legitimately fills the frame still uses opencv-perspective.
-    fill_result = _fill_ratio_document_crop(
-        full,
-        source,
-        output_path=output_path,
-        output_dir=output_dir,
-        save=False,
-        auto_orient=auto_orient,
-        prefer_portrait=prefer_portrait,
-        max_side=max_side,
-        margin_ratio=margin_ratio,
-        quality=quality,
+
+def _ddc_should_prefer_fill(
+    fill_result: dict[str, Any],
+    opencv_result: dict[str, Any],
+    opencv_component: dict[str, Any],
+    opencv_area: float,
+) -> bool:
+    """Return True when the fill-ratio result should be preferred over opencv."""
+    fill_area = float(fill_result.get("bboxArea") or 1.0)
+    opencv_edge = float(opencv_component.get("edgeDensity") or 0.0)
+    contained = _box_containment(fill_result.get("box"), opencv_result.get("box")) if opencv_result.get("ok") else 0.0
+    fragment_of_document = contained >= 0.85 and opencv_edge >= 0.05
+    return fill_area < 0.5 and not fragment_of_document and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area)
+
+
+def _ddc_validate_component_crop(
+    box: tuple[int, int, int, int],
+    original_width: int,
+    original_height: int,
+    coverage: float,
+    bbox_area: float,
+    source: Path,
+) -> "dict[str, Any] | None":
+    """Validate the connected-component crop box; return an error dict or None if ok."""
+    crop_width = box[2] - box[0]
+    crop_height = box[3] - box[1]
+    if crop_width < 50 or crop_height < 50:
+        return {"ok": False, "reason": "crop too small", "originalPath": str(source), "box": list(box)}
+    if box[0] <= 3 and box[1] <= 3 and box[2] >= original_width - 3 and box[3] >= original_height - 3:
+        return {"ok": False, "reason": "crop equals original", "originalPath": str(source), "box": list(box)}
+    partial_reason = _partial_edge_document_reason(
+        {"box": list(box), "originalWidth": original_width, "originalHeight": original_height, "bboxArea": round(bbox_area, 4)}
     )
-    fill_result = _reject_partial_edge_crop(fill_result)
-    if fill_result.get("partialEdge") and partial_rejection is None:
-        partial_rejection = fill_result
-    if fill_result.get("ok"):
-        fill_area = float(fill_result.get("bboxArea") or 1.0)
-        # If the fill-ratio box sits inside a text-rich opencv box, it is a bright
-        # sub-patch of that document (header whitespace, a fold), not a separate sheet.
-        # Preferring it would crop through the middle of the document, so keep opencv.
-        # A bright distractor (tape/table/fabric) has low edge density, so a fill box
-        # contained in *that* is still the real, tighter document and should win.
-        opencv_edge = float(opencv_component.get("edgeDensity") or 0.0)
-        contained = _box_containment(fill_result.get("box"), opencv_result.get("box")) if opencv_result.get("ok") else 0.0
-        fragment_of_document = contained >= 0.85 and opencv_edge >= 0.05
-        if fill_area < 0.5 and not fragment_of_document and (not opencv_result.get("ok") or fill_area < 0.6 * opencv_area):
-            if not save:
-                return fill_result
-            return _reject_partial_edge_crop(_fill_ratio_document_crop(
-                full,
-                source,
-                output_path=output_path,
-                output_dir=output_dir,
-                save=True,
-                auto_orient=auto_orient,
-                prefer_portrait=prefer_portrait,
-                max_side=max_side,
-                margin_ratio=margin_ratio,
-                quality=quality,
-            ))
+    if partial_reason:
+        return {
+            "ok": False,
+            "reason": partial_reason,
+            "partialEdge": True,
+            "originalPath": str(source),
+            "box": list(box),
+            "coverage": round(coverage, 4),
+            "bboxArea": round(bbox_area, 4),
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "cropWidth": crop_width,
+            "cropHeight": crop_height,
+        }
+    return None
 
-    if opencv_result.get("ok"):
-        if not save:
-            return opencv_result
-        return _reject_partial_edge_crop(_opencv_document_crop(
-            full,
-            source,
-            output_path=output_path,
-            output_dir=output_dir,
-            save=True,
-            auto_orient=auto_orient,
-            prefer_portrait=prefer_portrait,
-            max_side=max_side,
-            margin_ratio=margin_ratio,
-            quality=quality,
-            min_component_area_ratio=min_component_area_ratio,
-        ))
 
-    text_region_result = _text_region_document_crop(
-        full,
-        source,
-        output_path=output_path,
-        output_dir=output_dir,
-        save=False,
-        auto_orient=auto_orient,
-        prefer_portrait=prefer_portrait,
-        max_side=max_side,
-        margin_ratio=margin_ratio,
-        quality=quality,
-    )
-    text_region_result = _reject_partial_edge_crop(text_region_result)
-    if text_region_result.get("partialEdge") and partial_rejection is None:
-        partial_rejection = text_region_result
-    if text_region_result.get("ok"):
-        if not save:
-            return text_region_result
-        return _reject_partial_edge_crop(_text_region_document_crop(
-            full,
-            source,
-            output_path=output_path,
-            output_dir=output_dir,
-            save=True,
-            auto_orient=auto_orient,
-            prefer_portrait=prefer_portrait,
-            max_side=max_side,
-            margin_ratio=margin_ratio,
-            quality=quality,
-        ))
-
-    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
-    analysis = full.resize((max(1, int(original_width * scale)), max(1, int(original_height * scale)))) if scale < 1.0 else full
-    aw, ah = analysis.size
-    raw = analysis.tobytes()
-
-    candidates: list[dict[str, Any]] = []
-    for threshold in (185, 180, 190, 175, 200, 170):
-        candidates.extend(_candidate_components(
-            raw,
-            aw,
-            ah,
-            threshold,
-            min_component_area_ratio=min_component_area_ratio,
-        ))
+def _ddc_connected_component_crop(
+    full: Any,
+    source: Path,
+    candidates: list[dict[str, Any]],
+    scale: float,
+    aw: int,
+    ah: int,
+    original_width: int,
+    original_height: int,
+    partial_rejection: "dict[str, Any] | None",
+    *,
+    save: bool,
+    output_path: "str | Path | None",
+    output_dir: "str | Path | None",
+    quality: int,
+    margin_ratio: float,
+    auto_orient: bool,
+    prefer_portrait: bool,
+) -> dict[str, Any]:
+    """Finalise the connected-component candidate into a crop result."""
     if not candidates:
         if partial_rejection is not None:
             return partial_rejection
@@ -1908,7 +1976,6 @@ def detect_document_crop(
     top = max(0, top - pad_y)
     right = min(aw - 1, right + pad_x)
     bottom = min(ah - 1, bottom + pad_y)
-
     inv_scale = 1.0 / scale
     box = (
         max(0, int(left * inv_scale)),
@@ -1918,46 +1985,16 @@ def detect_document_crop(
     )
     crop_width = box[2] - box[0]
     crop_height = box[3] - box[1]
-    if crop_width < 50 or crop_height < 50:
-        return {"ok": False, "reason": "crop too small", "originalPath": str(source), "box": list(box)}
-    if box[0] <= 3 and box[1] <= 3 and box[2] >= original_width - 3 and box[3] >= original_height - 3:
-        return {"ok": False, "reason": "crop equals original", "originalPath": str(source), "box": list(box)}
-
-    partial_reason = _partial_edge_document_reason(
-        {
-            "box": list(box),
-            "originalWidth": original_width,
-            "originalHeight": original_height,
-            "bboxArea": round(bbox_area, 4),
-        }
-    )
-    if partial_reason:
-        return {
-            "ok": False,
-            "reason": partial_reason,
-            "partialEdge": True,
-            "originalPath": str(source),
-            "box": list(box),
-            "coverage": round(coverage, 4),
-            "bboxArea": round(bbox_area, 4),
-            "originalWidth": original_width,
-            "originalHeight": original_height,
-            "cropWidth": crop_width,
-            "cropHeight": crop_height,
-        }
+    validation_error = _ddc_validate_component_crop(box, original_width, original_height, coverage, bbox_area, source)
+    if validation_error is not None:
+        return validation_error
 
     cropped = full.crop(box)
     oriented, orientation = _orient_document_image(cropped, auto_orient=auto_orient, prefer_portrait=prefer_portrait)
 
     target = ""
     if save:
-        if output_path:
-            target_path = Path(output_path).expanduser().resolve()
-        elif output_dir:
-            out_dir = Path(output_dir).expanduser().resolve()
-            target_path = out_dir / f"{source.stem}-document-crop.jpg"
-        else:
-            target_path = source.with_name(f"{source.stem}-document-crop.jpg")
+        target_path = _resolve_output_path(source, output_path, output_dir)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         oriented.save(target_path, format="JPEG", quality=max(1, min(100, int(quality))), optimize=True)
         target = str(target_path)
@@ -1985,6 +2022,76 @@ def detect_document_crop(
         "width": oriented.size[0],
         "height": oriented.size[1],
     }
+
+
+def detect_document_crop(
+    image: str | Path,
+    *,
+    output_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    save: bool = True,
+    auto_orient: bool = True,
+    prefer_portrait: bool = True,
+    max_side: int = 700,
+    margin_ratio: float = 0.035,
+    quality: int = 94,
+    min_component_area_ratio: float = 0.004,
+    use_text_boundary: bool = True,
+    text_boundary_backend: str = "auto",
+) -> dict[str, Any]:
+    """Detect and optionally write a cropped document image.
+
+    Returns a metadata dict. ``ok`` is true only when a reliable crop is written
+    or, with ``save=False``, when a reliable box is detected.
+    """
+    loaded = _ddc_load_image(image)
+    if isinstance(loaded, dict):
+        return loaded
+    full, source, original_width, original_height = loaded
+
+    _kwargs_opencv = dict(
+        output_path=output_path, output_dir=output_dir, auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait, max_side=max_side, margin_ratio=margin_ratio,
+        quality=quality, min_component_area_ratio=min_component_area_ratio,
+    )
+    _kwargs_fill = dict(
+        output_path=output_path, output_dir=output_dir, auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait, max_side=max_side, margin_ratio=margin_ratio, quality=quality,
+    )
+    partial_rejection: dict[str, Any] | None = None
+
+    if use_text_boundary:
+        early, partial_rejection = _ddc_text_boundary_branch(
+            full, source, partial_rejection, save, _kwargs_opencv,
+            output_path=output_path, output_dir=output_dir, auto_orient=auto_orient,
+            prefer_portrait=prefer_portrait, margin_ratio=margin_ratio, quality=quality,
+            text_boundary_backend=text_boundary_backend,
+        )
+        if early is not None:
+            return early
+
+    _kwargs_text_region = dict(
+        output_path=output_path, output_dir=output_dir, auto_orient=auto_orient,
+        prefer_portrait=prefer_portrait, max_side=max_side, margin_ratio=margin_ratio, quality=quality,
+    )
+    cascade_result, partial_rejection = _ddc_geometry_cascade(
+        full, source, partial_rejection, save, _kwargs_opencv, _kwargs_fill, _kwargs_text_region,
+    )
+    if cascade_result is not None:
+        return cascade_result
+
+    scale = min(1.0, max(64, int(max_side)) / max(original_width, original_height))
+    analysis = full.resize((max(1, int(original_width * scale)), max(1, int(original_height * scale)))) if scale < 1.0 else full
+    aw, ah = analysis.size
+    raw = analysis.tobytes()
+    candidates: list[dict[str, Any]] = []
+    for threshold in (185, 180, 190, 175, 200, 170):
+        candidates.extend(_candidate_components(raw, aw, ah, threshold, min_component_area_ratio=min_component_area_ratio))
+    return _ddc_connected_component_crop(
+        full, source, candidates, scale, aw, ah, original_width, original_height, partial_rejection,
+        save=save, output_path=output_path, output_dir=output_dir, quality=quality,
+        margin_ratio=margin_ratio, auto_orient=auto_orient, prefer_portrait=prefer_portrait,
+    )
 
 
 @conn.handler("document/query/detect", isolated=True, meta={"label": "Detect document crop box", "cliAlias": "detect"})

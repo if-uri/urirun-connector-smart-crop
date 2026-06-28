@@ -106,6 +106,7 @@ def test_text_boundary_keeps_already_cropped_document_frame(monkeypatch, tmp_pat
 
 
 def test_text_boundary_expands_to_background_document_edges(monkeypatch, tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     image = Image.new("RGB", (520, 760), (116, 86, 55))
     draw = ImageDraw.Draw(image)
     draw.rectangle((128, 42, 402, 708), fill=(246, 245, 236))
@@ -402,7 +403,7 @@ def test_detect_document_crop_ignores_connected_bright_tape_and_crops_receipt(tm
     crop = detect_document_crop(source)
 
     assert crop["ok"] is True
-    assert crop["method"] in {"text-region", "opencv-perspective", "fill-ratio"}
+    assert crop["method"] in {"text-region", "opencv-perspective", "fill-ratio", "connected-component"}
     assert crop["bboxArea"] < 0.45
     assert crop["box"][0] > 90
     assert crop["box"][1] > 250
@@ -430,10 +431,11 @@ def test_detect_document_crop_prefers_receipt_over_large_edge_fabric_strip(tmp_p
     assert crop["box"][0] > 250
     assert crop["box"][1] > 280
     assert crop["bboxArea"] < 0.35
-    assert crop["method"] in {"fill-ratio", "text-region", "opencv-perspective"}
+    assert crop["method"] in {"fill-ratio", "text-region", "opencv-perspective", "connected-component"}
 
 
 def test_detect_document_crop_rectifies_perspective_document(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     image = Image.new("RGB", (600, 420), (45, 47, 50))
     draw = ImageDraw.Draw(image)
     draw.polygon([(180, 40), (420, 75), (390, 370), (145, 330)], fill=(247, 245, 235), outline=(20, 20, 20))
@@ -454,6 +456,7 @@ def test_detect_document_crop_rectifies_perspective_document(tmp_path: Path) -> 
 
 
 def test_detect_document_crop_keeps_document_touching_frame_edge(tmp_path: Path) -> None:
+    pytest.importorskip("cv2")
     image = Image.new("RGB", (420, 620), (38, 39, 42))
     draw = ImageDraw.Draw(image)
     draw.rectangle((2, 12, 260, 610), fill=(248, 247, 240), outline=(20, 20, 20), width=3)

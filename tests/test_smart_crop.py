@@ -613,6 +613,16 @@ def test_manifest() -> None:
     json.dumps(manifest)
 
 
+def test_contract_output_shape() -> None:
+    """Contract examples and a cheap live error output must satisfy the declared schema."""
+    from urirun_connectors_toolkit.contract_gate import conform, validate_output
+    from urirun_connector_smart_crop.contracts import CONTRACTS
+
+    conform(CONTRACTS)
+    validate_output(CONTRACTS["document/query/detect"], document_detect(image=""))
+    validate_output(CONTRACTS["document/query/crop"], document_crop(image=""))
+
+
 def test_detect_document_crop_handles_receipt_with_brightness_gradient(tmp_path: Path) -> None:
     """The real QUO CAFE failure: a small receipt with a top-to-bottom brightness gradient
     (top whiter than bottom) next to a large light duct-tape 'L'. The fill-ratio solid-sheet

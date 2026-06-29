@@ -5,7 +5,17 @@ from __future__ import annotations
 
 from urirun_connectors_toolkit.contract_gate import Contract
 
-_BOX = {"x": "int", "y": "int", "w": "int", "h": "int"}
+_CROP_RESULT = {
+    "ok": "bool",
+    "connector": "const:smart-crop",
+    "image": "?str",
+    "crop": "?obj",
+    "path": "?str",
+    "originalPath": "?str",
+    "kind": "?str",
+    "live": "?bool",
+    "error": "?str",
+}
 
 CONTRACTS: dict[str, Contract] = {
     "document/query/detect": Contract(
@@ -13,7 +23,7 @@ CONTRACTS: dict[str, Contract] = {
         effect="query",
         reversible=False,
         inp={"image": "str", "auto_orient": "?bool", "prefer_portrait": "?bool"},
-        out={"ok": "bool", "box": "?obj", "confidence": "?num", "method": "?str"},
+        out=_CROP_RESULT,
         errors=("precondition-unmet",),
         examples=(
             {
@@ -21,9 +31,10 @@ CONTRACTS: dict[str, Contract] = {
                 "result": {
                     "ok": True,
                     "connector": "smart-crop",
-                    "box": {"x": 10, "y": 10, "w": 800, "h": 600},
-                    "confidence": 0.92,
-                    "method": "paddleocr",
+                    "image": "/tmp/scan.jpg",
+                    "crop": {"ok": True, "box": [10, 10, 800, 600], "method": "paddleocr"},
+                    "kind": "crop-detection",
+                    "live": False,
                 },
             },
         ),
@@ -33,7 +44,7 @@ CONTRACTS: dict[str, Contract] = {
         effect="query",
         reversible=False,
         inp={"image": "str", "output_path": "?str", "output_dir": "?str"},
-        out={"ok": "bool", "path": "?str", "box": "?obj", "method": "?str"},
+        out=_CROP_RESULT,
         errors=("precondition-unmet",),
         examples=(
             {
@@ -41,9 +52,12 @@ CONTRACTS: dict[str, Contract] = {
                 "result": {
                     "ok": True,
                     "connector": "smart-crop",
+                    "image": "/tmp/scan.jpg",
                     "path": "/tmp/scan_cropped.jpg",
-                    "box": {"x": 10, "y": 10, "w": 800, "h": 600},
-                    "method": "paddleocr",
+                    "originalPath": "/tmp/scan.jpg",
+                    "crop": {"ok": True, "box": [10, 10, 800, 600], "method": "paddleocr"},
+                    "kind": "document-crop",
+                    "live": False,
                 },
             },
         ),
